@@ -256,12 +256,11 @@ def transcribe_via_whisper_cpp(audio_path: str, model: str = "base") -> Optional
 
         segments = []
         for line in result.stdout.split("\n"):
-            match = re.match(r"\[(\d{2}:\d{2}\.\d{3}) --> (\d{2}:\d{2}\.\d{3})\]\s*(.+)", line)
+            match = re.match(r"\[(\d{2}:\d{2}:\d{2}\.\d{3}) --> (\d{2}:\d{2}:\d{2}\.\d{3})\]\s*(.+)", line)
             if match:
                 def parse_whisper_time(ts: str) -> float:
                     parts = ts.split(":")
-                    sec_parts = parts[2].split(".")
-                    return float(parts[0]) * 60 + float(parts[1]) + float(f"0.{sec_parts[1]}")
+                    return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
                 start = parse_whisper_time(match.group(1))
                 end = parse_whisper_time(match.group(2))
                 text = match.group(3).strip()
