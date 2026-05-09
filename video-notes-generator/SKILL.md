@@ -13,6 +13,9 @@ metadata:
 
 # Video Notes Generator
 
+> Based on [BiliNote v2.2.1](https://github.com/JefferyHcool/BiliNote) by JefferyHcool.
+> No external LLM / API Key required. The Agent itself acts as the LLM for note generation.
+
 Converts video content from URLs or local files into structured, readable Markdown notes using AI. Supports multiple video platforms, transcription engines, and note styles.
 
 Extracted from **BiliNote v2.2.1** by JefferyHcool.
