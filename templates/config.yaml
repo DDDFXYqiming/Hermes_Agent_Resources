@@ -1,0 +1,46 @@
+# Video Notes Generator - Advanced Configuration
+# Copy this file to config.yaml and customize as needed.
+
+# --- LLM Settings ---
+llm:
+  # OpenAI-compatible API settings
+  api_key: "${OPENAI_API_KEY}"        # Or set via environment variable
+  base_url: "https://api.openai.com/v1"
+  model: "gpt-4o-mini"                # Model to use for note generation
+  temperature: 0.7                     # Lower = more focused, higher = more creative
+  max_tokens: 4096                     # Max tokens per LLM response
+
+# --- Transcription Settings ---
+transcriber:
+  type: "fast-whisper"                 # fast-whisper, groq, bcut, kuaishou, mlx-whisper
+  whisper:
+    model_size: "base"                 # tiny, base, small, medium, large-v3
+    device: "auto"                     # auto, cuda, cpu (auto detects GPU)
+  groq:
+    api_key: "${GROQ_API_KEY}"
+    model: "whisper-large-v3-turbo"
+
+# --- Download Settings ---
+download:
+  quality: "fast"                      # fast, normal, high
+  output_dir: "./cache"                # Temporary download cache
+  cookies:
+    bilibili: ""                       # Bilibili cookie string (SESSDATA=xxx; bili_jct=xxx)
+    youtube: ""                        # YouTube cookies file path (Netscape format)
+
+# --- Output Settings ---
+output:
+  dir: "./note_results"                # Where to save generated notes
+  format:
+    - "toc"                            # Generate table of contents
+    - "link"                           # Add timestamp markers (*Content-[mm:ss])
+    - "screenshot"                     # Add screenshot placeholders (*Screenshot-[mm:ss])
+    - "summary"                        # Append AI summary
+  style: "detailed"                    # Note style (see style guide)
+
+# --- Chunking Settings ---
+# For long videos, the transcript is split into chunks for processing.
+chunking:
+  enabled: true
+  max_segment_chars: 3000              # Max characters per chunk sent to LLM
+  merge_strategy: "sequential"         # sequential (preserves order)
