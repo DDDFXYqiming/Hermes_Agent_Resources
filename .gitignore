@@ -4,6 +4,7 @@ venv/
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
 
 # IDE
 .vscode/
@@ -13,3 +14,20 @@ __pycache__/
 .DS_Store
 Thumbs.db
 examples/
+
+# Local-only project SPEC/profile docs
+SPEC.md
+SPEC.*.md
+SPEC_*.md
+SPEC-*.md
+spec.md
+spec.*.md
+spec_*.md
+spec-*.md
+
+# Local agent / planning artifacts
+.trae/
+.onboarded
+plan_*/
+skills/
+uv.lock
