@@ -1,21 +1,84 @@
 name: language-router
-version: 3.1.0
-description: "Universal research-enhanced intelligent thinking language selection. Auto-detects user language and aligns output accordingly. Works for ANY language pair, not just Chinese-English. Based on academic research showing language mixing enhances reasoning (+5.6% accuracy)."
+version: 4.0.0
+description: "Planner -> Worker Reasoner -> Critic Verifier -> Digest Injector multilingual pre-LLM routing plugin. Injects bounded digest, preserves output language, and avoids raw chain-of-thought."
 author: "Diana (NousResearch)"
 provides_hooks:
   - pre_llm_call
 default_config:
-  classifier:
+  planner:
+    enabled: true
+    provider: null
+    model: null
     temperature: 0.0
-    max_tokens: 200
+    max_tokens: 300
     timeout: 15
-  reasoning:
+    disable_reasoning_if_supported: true
+    confidence_threshold: 0.6
+  reasoner:
+    enabled: true
+    provider: null
+    model: null
     temperature: 0.0
-    max_tokens: 1500
+    max_tokens: 1200
     timeout: 60
+    default_thinking_language: en
     reasoning_effort: high
+  verifier:
+    enabled: auto
+    provider: null
+    model: null
+    temperature: 0.0
+    max_tokens: 700
+    timeout: 45
+    confidence_threshold: 0.75
+    trigger_tasks:
+      - debug
+      - programming
+      - math
+      - research
+      - architecture_design
+      - financial_or_medical
+      - legal_or_policy
+      - safety_sensitive
+  reasoning:
+    enabled: true
+    mode: auto
+    allowed_modes:
+      - "off"
+      - simple
+      - verify
+      - self_consistency
+      - tree
+    self_consistency:
+      enabled: false
+      max_paths: 3
+      trigger_tasks:
+        - math
+        - logic
+        - complex_debug
+    expose_raw_cot: false
+    digest_only: true
+  output:
+    preserve_user_language: true
+    respect_explicit_language_request: true
+    fallback_language: en
   cache:
     enabled: true
     ttl_seconds: 300
     max_entries: 1000
-  confidence_threshold: 0.6
+    cache_plans: true
+    cache_reasoning: false
+  digest:
+    max_tokens: 500
+    include_plan_summary: true
+    include_verifier_summary: true
+    include_raw_notes: false
+  debug:
+    show_footer: false
+    log_plan: true
+    log_verifier: true
+    log_digest_metadata: true
+  latency_budget:
+    enabled: true
+    max_total_seconds: 90
+    skip_verifier_if_budget_low: true

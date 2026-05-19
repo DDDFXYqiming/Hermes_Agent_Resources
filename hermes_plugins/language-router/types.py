@@ -1,0 +1,56 @@
+"""Structured data contracts for language-router v4."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+
+@dataclass
+class ReasoningPlan:
+    user_language: str
+    explicit_output_language: Optional[str]
+    final_output_language: str
+    task_type: str
+    task_complexity: str
+    risk_level: str
+    confidence: float
+    thinking_language: str
+    reasoning_mode: str
+    verifier_required: bool
+    self_consistency_paths: int
+    constraints: list[str] = field(default_factory=list)
+    reasoning_instructions: str = ""
+    fallback_reason: Optional[str] = None
+
+
+@dataclass
+class ReasoningDraft:
+    task_understanding: str
+    key_points: list[str] = field(default_factory=list)
+    candidate_conclusions: list[str] = field(default_factory=list)
+    assumptions: list[str] = field(default_factory=list)
+    risks: list[str] = field(default_factory=list)
+    missing_information: list[str] = field(default_factory=list)
+    suggested_answer_outline: list[str] = field(default_factory=list)
+    confidence: float = 0.5
+    raw_notes: Optional[str] = None
+
+
+@dataclass
+class VerificationReport:
+    verdict: str
+    issues: list[str] = field(default_factory=list)
+    unsupported_claims: list[str] = field(default_factory=list)
+    missed_constraints: list[str] = field(default_factory=list)
+    safety_notes: list[str] = field(default_factory=list)
+    revised_key_points: list[str] = field(default_factory=list)
+    revised_answer_outline: list[str] = field(default_factory=list)
+    confidence: float = 0.5
+
+
+@dataclass
+class InjectedDigest:
+    context: str
+    metadata: dict[str, Any]
+    debug_footer: Optional[str]
+    token_estimate: int

@@ -24,10 +24,12 @@ spec.md
 spec.*.md
 spec_*.md
 spec-*.md
+hermes_plugins/language-router/SPEC.md
 
 # Local agent / planning artifacts
 .trae/
 .onboarded
 plan_*/
 skills/
+temp/
 uv.lock

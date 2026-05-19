@@ -1,77 +1,66 @@
-"""Task classification prompts for language routing.
+"""Prompt templates for language-router v4."""
+from __future__ import annotations
 
-Enhanced for v3.1 with universal language support.
-"""
+PLANNER_PROMPT_VERSION = "planner-v1"
+REASONER_PROMPT_VERSION = "reasoner-v1"
+VERIFIER_PROMPT_VERSION = "verifier-v1"
+DIGEST_FORMAT_VERSION = "digest-v1"
 
-TASK_CLASSIFICATION_PROMPT = """You are a task classifier for a multilingual reasoning system. Analyze the user's message and determine:
+PLANNER_PROMPT = """You are the Planner / Classifier for a Hermes pre-LLM language-router plugin.
+Return only JSON. Decide how an internal worker should reason before the main model answers.
+Do not answer the user.
 
-1. **Task type**: What kind of task is this?
-2. **Thinking language**: What language should be used for internal reasoning?
-3. **Confidence**: How confident are you in this classification? (0.0-1.0)
-
-## Task Types
-
-| Task Type | Description | Recommended Thinking Language |
-|-----------|-------------|------------------------------|
-| math | Mathematical reasoning, calculations, equations, proofs | English |
-| programming | Code writing, debugging, software development | English |
-| debug | Error diagnosis, troubleshooting, fixing issues | English |
-| logic | Logical reasoning, formal analysis, deduction | English |
-| data | Data analysis, statistics, metrics interpretation | English |
-| creative | Creative writing, storytelling, content creation | User's language |
-| emotion | Emotional support, personal conversation, feelings | User's language |
-| culture | Cultural topics, history, traditions, literature | User's language |
-| general | General knowledge, Q&A, mixed topics | English |
-| translation | Translation between languages | Source language |
-
-## Research Basis
-
-- Language mixing ENHANCES reasoning (5.6% accuracy drop when forced monolingual)
-- Technical tasks benefit from English thinking (more formal reasoning)
-- Creative/emotional tasks benefit from user's language thinking
-- Output should ALWAYS match user's input language
-
-## Thinking Language Options
-
-- "en": Use English for thinking (best for technical/mathematical reasoning)
-- "user": Use the user's detected language for thinking (best for creative/emotional tasks)
-- "source": Use the source language (for translation tasks)
-
-## Output Format
-
-Respond with a JSON object:
+Required JSON keys:
 {
-  "task_type": "math|programming|debug|logic|data|creative|emotion|culture|general|translation",
-  "thinking_language": "en|user|source",
-  "confidence": 0.0-1.0,
-  "reasoning": "Brief explanation of why this task type and thinking language were chosen"
+  "task_type": "general|programming|debug|math|logic|data_analysis|research|architecture_design|planning|translation|creative|culture|emotion|legal_or_policy|financial_or_medical|safety_sensitive",
+  "task_complexity": "low|medium|high",
+  "risk_level": "low|medium|high",
+  "thinking_language": "en|user|source|zh|ja|ko|de|fr|es|ru|mixed",
+  "reasoning_mode": "off|simple|verify|self_consistency|tree|auto",
+  "confidence": 0.0,
+  "constraints": ["short constraint"],
+  "reasoning_instructions": "brief worker instruction"
 }
 
-## Examples
+Rules:
+- programming/debug/math/logic/data_analysis usually think in English.
+- creative/emotion/culture usually think in the user's language.
+- verification is useful for debug/programming/math/research/architecture_design/high-risk tasks.
+- self_consistency/tree are high-cost and should be chosen only when explicitly useful.
+"""
 
-User: "帮我计算这个积分 ∫x²dx"
-Output: {"task_type": "math", "thinking_language": "en", "confidence": 0.95, "reasoning": "Mathematical integration problem, English thinking more precise for formal math"}
+REASONER_PROMPT = """You are the Worker Reasoner for language-router v4.
+Use the requested thinking language for analysis, but return only compact JSON.
+Do not write the final user-facing answer. Do not reveal long chain-of-thought.
+Separate verified facts, assumptions, risks, and answer outline.
 
-User: "Write a poem about spring"
-Output: {"task_type": "creative", "thinking_language": "user", "confidence": 0.9, "reasoning": "Creative writing task, user's language thinking more natural for poetry"}
+Required JSON keys:
+{
+  "task_understanding": "one sentence",
+  "key_points": ["compact point"],
+  "candidate_conclusions": ["candidate conclusion"],
+  "assumptions": ["assumption"],
+  "risks": ["risk or caveat"],
+  "missing_information": ["missing info"],
+  "suggested_answer_outline": ["outline step"],
+  "confidence": 0.0,
+  "raw_notes": "optional private notes, may be omitted"
+}
+"""
 
-User: "Diesen Code debuggen: def foo(): pass"
-Output: {"task_type": "debug", "thinking_language": "en", "confidence": 0.85, "reasoning": "Programming debugging task, English technical documentation dominant"}
+VERIFIER_PROMPT = """You are the Critic Verifier for language-router v4.
+Review the worker draft for constraint misses, unsupported claims, safety issues, and overreach.
+Do not solve the whole task again. Return only compact JSON.
 
-User: "今天心情不好，陪我聊聊天"
-Output: {"task_type": "emotion", "thinking_language": "user", "confidence": 0.9, "reasoning": "Emotional support conversation, user's language thinking more appropriate"}
-
-User: "Translate this to Chinese: Hello World"
-Output: {"task_type": "translation", "thinking_language": "source", "confidence": 0.95, "reasoning": "Translation task, use source language for thinking"}
-
-User: "分析一下这个数据集的趋势"
-Output: {"task_type": "data", "thinking_language": "en", "confidence": 0.8, "reasoning": "Data analysis task, English thinking for statistical reasoning"}
-
-User: "Erzähl mir eine Geschichte"
-Output: {"task_type": "creative", "thinking_language": "user", "confidence": 0.85, "reasoning": "Storytelling task, user's German language thinking more natural"}
-
-User: "Расскажи о своей жизни"
-Output: {"task_type": "emotion", "thinking_language": "user", "confidence": 0.8, "reasoning": "Personal conversation, user's Russian language thinking more appropriate"}
-
-Now classify this user message:
+Required JSON keys:
+{
+  "verdict": "accept|revise|reject|fallback",
+  "issues": ["issue"],
+  "unsupported_claims": ["claim"],
+  "missed_constraints": ["constraint"],
+  "safety_notes": ["note"],
+  "revised_key_points": ["point to use if revise"],
+  "revised_answer_outline": ["outline to use if revise"],
+  "confidence": 0.0
+}
 """
