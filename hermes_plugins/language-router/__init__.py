@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import re
+from pathlib import Path
 from typing import Any, Optional, Dict, List, Tuple
 
 from hermes_cli.plugins import PluginContext
@@ -94,6 +95,26 @@ DEFAULTS = {
     "reasoning_effort": "high",
 }
 
+DEFAULT_CONFIG = {
+    "classifier": {
+        "temperature": 0.0,
+        "max_tokens": 200,
+        "timeout": 15,
+    },
+    "reasoning": {
+        "temperature": 0.0,
+        "max_tokens": 1500,
+        "timeout": 60,
+        "reasoning_effort": "high",
+    },
+    "cache": {
+        "enabled": True,
+        "ttl_seconds": 300,
+        "max_entries": 1000,
+    },
+    "confidence_threshold": 0.6,
+}
+
 
 def _detect_language(text: str) -> str:
     """Detect the primary language of text.
@@ -146,19 +167,49 @@ def _get_lang_name(lang_code: str) -> str:
     return LANG_NAMES.get(lang_code, lang_code.upper())
 
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge override into base without mutating inputs."""
+    merged = dict(base)
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _load_manifest_default_config() -> dict:
+    """Load default plugin config from plugin.yaml."""
+    manifest_path = Path(__file__).with_name("plugin.yaml")
+    if not manifest_path.exists():
+        return dict(DEFAULT_CONFIG)
+    try:
+        import yaml
+        with open(manifest_path, encoding="utf-8") as f:
+            manifest = yaml.safe_load(f) or {}
+        manifest_config = manifest.get("default_config") or manifest.get("config") or {}
+        return _deep_merge(DEFAULT_CONFIG, manifest_config)
+    except Exception as exc:
+        logger.warning("Failed to load language-router manifest defaults: %s", exc)
+        return dict(DEFAULT_CONFIG)
+
+
 def _load_plugin_config() -> dict:
-    """Load plugin config from config.yaml."""
+    """Load plugin config: manifest defaults plus user overrides from config.yaml."""
     from hermes_constants import get_hermes_home
+    default_config = _load_manifest_default_config()
     config_path = get_hermes_home() / "config.yaml"
     if not config_path.exists():
-        return {}
+        return default_config
     try:
         import yaml
         with open(config_path, encoding="utf-8") as f:
             all_config = yaml.safe_load(f) or {}
-        return cfg_get(all_config, "plugins", "entries", "language-router", "config", default={}) or {}
-    except Exception:
-        return {}
+        user_config = cfg_get(all_config, "plugins", "entries", "language-router", "config", default={}) or {}
+        return _deep_merge(default_config, user_config)
+    except Exception as exc:
+        logger.warning("Failed to load language-router user config: %s", exc)
+        return default_config
 
 
 def _build_llm_params(section_cfg: dict) -> dict:
@@ -200,6 +251,7 @@ class LanguageRouterPlugin:
         
         # Initialize cache
         cache_cfg = self._config.get("cache", {})
+        self._cache_enabled = cache_cfg.get("enabled", True)
         self._cache = ClassificationCache(
             max_entries=cache_cfg.get("max_entries", 1000),
             ttl_seconds=cache_cfg.get("ttl_seconds", 300),
@@ -217,13 +269,15 @@ class LanguageRouterPlugin:
         """Classify the user message."""
         self._total_classifications += 1
         
-        cached_result = self._cache.get(user_message)
-        if cached_result:
-            self._cache_hits += 1
-            return cached_result
+        if self._cache_enabled:
+            cached_result = self._cache.get(user_message)
+            if cached_result:
+                self._cache_hits += 1
+                return cached_result
         
         classification = self._classifier.classify(user_message)
-        self._cache.put(user_message, classification)
+        if self._cache_enabled:
+            self._cache.put(user_message, classification)
         
         logger.info(
             "Language router classified: task=%s, thinking_lang=%s, confidence=%.2f",
@@ -405,6 +459,7 @@ class LanguageRouterPlugin:
             "classifier_overrides": {k: v for k, v in self._classifier_params.items() if k in ("provider", "model")},
             "reasoning_overrides": {k: v for k, v in self._reasoning_params.items() if k in ("provider", "model")},
             "reasoning_effort": self._reasoning_effort,
+            "cache_enabled": self._cache_enabled,
             "cache": cache_stats,
         }
 
@@ -462,6 +517,7 @@ def _handle_stats_command(raw_args: str) -> str:
         f"  Effort:     {stats['reasoning_effort']}",
         "",
         "Cache Status:",
+        f"  Enabled:  {stats['cache_enabled']}",
         f"  Size:     {cache['size']}/{cache['max_size']}",
         f"  TTL:      {cache['ttl_seconds']}s",
         f"  Hit rate: {cache['hit_rate']:.1%}",
