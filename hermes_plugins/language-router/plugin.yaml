@@ -1,8 +1,8 @@
 name: language-router
-version: 4.0.0
-description: "Planner -> Worker Reasoner -> Critic Verifier -> Digest Injector multilingual pre-LLM routing plugin. Injects bounded digest, preserves output language, and avoids raw chain-of-thought."
+version: 4.1.0
+description: "Language Router Plugin v4.1 — Planner -> Worker -> Verifier -> Digest with Tree/Self-consistency/Cache/Budget"
 author: "Diana (NousResearch)"
-provides_hooks:
+hooks:
   - pre_llm_call
 default_config:
   planner:
@@ -31,15 +31,6 @@ default_config:
     max_tokens: 700
     timeout: 45
     confidence_threshold: 0.75
-    trigger_tasks:
-      - debug
-      - programming
-      - math
-      - research
-      - architecture_design
-      - financial_or_medical
-      - legal_or_policy
-      - safety_sensitive
   reasoning:
     enabled: true
     mode: auto
@@ -50,12 +41,21 @@ default_config:
       - self_consistency
       - tree
     self_consistency:
-      enabled: false
+      enabled: true
       max_paths: 3
       trigger_tasks:
         - math
         - logic
         - complex_debug
+    tree:
+      enabled: true
+      max_branches: 3
+      pruning_threshold: 0.6
+      trigger_tasks:
+        - math
+        - logic
+        - complex_debug
+        - architecture_design
     expose_raw_cot: false
     digest_only: true
   output:
@@ -82,3 +82,8 @@ default_config:
     enabled: true
     max_total_seconds: 90
     skip_verifier_if_budget_low: true
+    skip_reasoner_if_budget_low: true
+    degradation_thresholds:
+      high: 0.7
+      medium: 0.4
+      low: 0.2

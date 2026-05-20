@@ -1,4 +1,4 @@
-"""Language Router Plugin v4 — Planner -> Worker -> Verifier -> Digest."""
+"""Language Router Plugin v4.1 — Planner -> Worker -> Verifier -> Digest with Tree/Self-consistency/Cache/Budget."""
 from __future__ import annotations
 
 import json
@@ -25,7 +25,7 @@ from .types import InjectedDigest, ReasoningDraft, ReasoningPlan, VerificationRe
 
 logger = logging.getLogger(__name__)
 
-VERSION = "4.0.0"
+VERSION = "4.1.0"
 
 LANG_PATTERNS = {
     "ja_hiragana": re.compile(r"[\u3040-\u309f]"),
@@ -90,7 +90,8 @@ DEFAULT_CONFIG = {
         "enabled": True,
         "mode": "auto",
         "allowed_modes": ["off", "simple", "verify", "self_consistency", "tree"],
-        "self_consistency": {"enabled": False, "max_paths": 3, "trigger_tasks": ["math", "logic", "complex_debug"]},
+        "self_consistency": {"enabled": True, "max_paths": 3, "trigger_tasks": ["math", "logic", "complex_debug"]},
+        "tree": {"enabled": True, "max_branches": 3, "pruning_threshold": 0.6, "trigger_tasks": ["math", "logic", "complex_debug", "architecture_design"]},
         "expose_raw_cot": False,
         "digest_only": True,
     },
@@ -98,7 +99,13 @@ DEFAULT_CONFIG = {
     "cache": {"enabled": True, "ttl_seconds": 300, "max_entries": 1000, "cache_plans": True, "cache_reasoning": False},
     "digest": {"max_tokens": 500, "include_plan_summary": True, "include_verifier_summary": True, "include_raw_notes": False},
     "debug": {"show_footer": False, "log_plan": True, "log_verifier": True, "log_digest_metadata": True},
-    "latency_budget": {"enabled": True, "max_total_seconds": 90, "skip_verifier_if_budget_low": True},
+    "latency_budget": {
+        "enabled": True,
+        "max_total_seconds": 90,
+        "skip_verifier_if_budget_low": True,
+        "skip_reasoner_if_budget_low": True,
+        "degradation_thresholds": {"high": 0.7, "medium": 0.4, "low": 0.2},
+    },
 }
 
 
@@ -217,7 +224,6 @@ def _build_llm_params(section_cfg: dict, max_default: int, timeout_default: int,
 
 
 def _mode_name(value: Any) -> str:
-    # YAML 1.1 parses unquoted 'off' as False; keep config compatibility.
     if value is False:
         return "off"
     if value is True:
@@ -248,8 +254,77 @@ def _json_for_prompt(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, default=str)
 
 
+class LatencyBudgetManager:
+    """管理延迟预算，支持多级降级策略。"""
+
+    def __init__(self, config: dict):
+        self._config = config.get("latency_budget", {})
+        self._enabled = bool(self._config.get("enabled", True))
+        self._max_seconds = float(self._config.get("max_total_seconds", 90))
+        self._thresholds = self._config.get("degradation_thresholds", {"high": 0.7, "medium": 0.4, "low": 0.2})
+        self._start_time: Optional[float] = None
+        self._degradation_level = "none"
+        self._notifications: list[str] = []
+
+    def start(self):
+        self._start_time = time.time()
+        self._degradation_level = "none"
+        self._notifications = []
+
+    def get_elapsed(self) -> float:
+        if self._start_time is None:
+            return 0.0
+        return time.time() - self._start_time
+
+    def get_remaining_ratio(self) -> float:
+        if not self._enabled or self._max_seconds <= 0:
+            return 1.0
+        elapsed = self.get_elapsed()
+        return max(0.0, 1.0 - (elapsed / self._max_seconds))
+
+    def get_degradation_level(self) -> str:
+        if not self._enabled:
+            return "none"
+        ratio = self.get_remaining_ratio()
+        high_threshold = self._thresholds.get("high", 0.7)
+        medium_threshold = self._thresholds.get("medium", 0.4)
+        low_threshold = self._thresholds.get("low", 0.2)
+        if ratio < low_threshold:
+            return "critical"
+        elif ratio < medium_threshold:
+            return "low"
+        elif ratio < high_threshold:
+            return "medium"
+        return "none"
+
+    def should_skip_verifier(self) -> bool:
+        if not self._enabled:
+            return False
+        skip_config = self._config.get("skip_verifier_if_budget_low", True)
+        if not skip_config:
+            return False
+        level = self.get_degradation_level()
+        return level in {"low", "critical"}
+
+    def should_skip_reasoner(self) -> bool:
+        if not self._enabled:
+            return False
+        skip_config = self._config.get("skip_reasoner_if_budget_low", True)
+        if not skip_config:
+            return False
+        level = self.get_degradation_level()
+        return level == "critical"
+
+    def add_notification(self, message: str):
+        self._notifications.append(message)
+        logger.info("Latency budget notification: %s", message)
+
+    def get_notifications(self) -> list[str]:
+        return list(self._notifications)
+
+
 class LanguageRouterPlugin:
-    """Structured language-router v4 pipeline."""
+    """Structured language-router v4.1 pipeline with Tree/Self-consistency/Cache/Budget."""
 
     def __init__(self, ctx: PluginContext):
         self._ctx = ctx
@@ -261,11 +336,14 @@ class LanguageRouterPlugin:
         self._stats = {
             "planner_calls": 0, "reasoner_calls": 0, "verifier_calls": 0, "digest_injections": 0,
             "cache_hits": 0, "fallbacks": 0, "failures": 0,
+            "tree_branches": 0, "tree_pruned": 0, "self_consistency_merges": 0,
+            "budget_degradations": 0,
         }
         self._mode_counts: dict[str, int] = {}
         self._detected_languages: dict[str, int] = {}
         self._last_run: dict[str, Any] = {}
-        logger.info("Language Router v4 initialized config=%s", self._config)
+        self._budget_manager = LatencyBudgetManager(self._config)
+        logger.info("Language Router v4.1 initialized config=%s", self._config)
 
     def _heuristic_task(self, user_message: str) -> tuple[str, float]:
         msg = user_message.lower()
@@ -304,20 +382,38 @@ class LanguageRouterPlugin:
         configured = _mode_name(reasoning_cfg.get("mode", "auto"))
         if configured in ALLOWED_MODES:
             return configured if configured in allowed else "simple"
-        if self._explicit_high_cost_allowed(user_message) and reasoning_cfg.get("self_consistency", {}).get("enabled") and "self_consistency" in allowed:
-            return "self_consistency"
+
+        # Check tree trigger_tasks
+        tree_cfg = reasoning_cfg.get("tree", {})
+        if tree_cfg.get("enabled") and "tree" in allowed:
+            tree_triggers = tree_cfg.get("trigger_tasks", [])
+            if task_type in tree_triggers:
+                return "tree"
+
+        # Check self_consistency trigger_tasks
+        sc_cfg = reasoning_cfg.get("self_consistency", {})
+        if sc_cfg.get("enabled") and "self_consistency" in allowed:
+            sc_triggers = sc_cfg.get("trigger_tasks", [])
+            if task_type in sc_triggers:
+                return "self_consistency"
+
+        # Explicit high-cost keywords override
+        if self._explicit_high_cost_allowed(user_message):
+            if tree_cfg.get("enabled") and "tree" in allowed:
+                return "tree"
+            if sc_cfg.get("enabled") and "self_consistency" in allowed:
+                return "self_consistency"
+
         if task_type in VERIFIER_TASKS or risk_level in {"medium", "high"} or confidence < self._config.get("verifier", {}).get("confidence_threshold", 0.75):
             return "verify" if "verify" in allowed else "simple"
         if requested_mode in ALLOWED_MODES and requested_mode in allowed:
             if requested_mode == "off":
                 return "off"
-            if requested_mode in {"self_consistency", "tree"} and not self._explicit_high_cost_allowed(user_message):
-                return "verify" if "verify" in allowed else "simple"
             return requested_mode
         return "simple" if "simple" in allowed else "off"
 
     def _explicit_high_cost_allowed(self, user_message: str) -> bool:
-        return bool(re.search(r"多角度|复核|验证|算准|self[-_ ]?consistency|tree of thought|多个方案", user_message, re.I))
+        return bool(re.search(r"多角度|复核|验证|算准|self[-_ ]?consistency|tree of thought|多个方案|深度分析", user_message, re.I))
 
     def _planner_fallback(self, user_message: str, reason: str) -> ReasoningPlan:
         user_lang = _detect_language(user_message)
@@ -327,6 +423,7 @@ class LanguageRouterPlugin:
         complexity = "medium" if task_type in TECH_TASKS else "low"
         thinking = self._resolve_thinking_language(task_type, "en" if task_type in TECH_TASKS else "user", user_lang)
         mode = self._choose_mode(task_type, confidence, risk, "auto", user_message)
+        tree_cfg = self._config.get("reasoning", {}).get("tree", {})
         return ReasoningPlan(
             user_language=user_lang,
             explicit_output_language=explicit,
@@ -339,6 +436,7 @@ class LanguageRouterPlugin:
             reasoning_mode=mode,
             verifier_required=mode in {"verify", "self_consistency"},
             self_consistency_paths=self._self_consistency_paths(mode),
+            tree_branches=self._tree_branches(mode),
             constraints=["Respect explicit output language" if explicit else "Preserve user's language"],
             reasoning_instructions="Produce a compact structured analysis for the main model.",
             fallback_reason=reason,
@@ -349,6 +447,12 @@ class LanguageRouterPlugin:
             return 1
         scfg = self._config.get("reasoning", {}).get("self_consistency", {})
         return max(2, min(5, int(scfg.get("max_paths", 3))))
+
+    def _tree_branches(self, mode: str) -> int:
+        if mode != "tree":
+            return 1
+        tcfg = self._config.get("reasoning", {}).get("tree", {})
+        return max(2, min(5, int(tcfg.get("max_branches", 3))))
 
     def _parse_plan(self, parsed: dict, user_message: str) -> ReasoningPlan:
         user_lang = _detect_language(user_message)
@@ -375,6 +479,7 @@ class LanguageRouterPlugin:
             reasoning_mode=mode,
             verifier_required=verifier_required,
             self_consistency_paths=self._self_consistency_paths(mode),
+            tree_branches=self._tree_branches(mode),
             constraints=_as_list(parsed.get("constraints")),
             reasoning_instructions=str(parsed.get("reasoning_instructions") or "Produce a compact structured analysis for the main model."),
         )
@@ -404,14 +509,14 @@ class LanguageRouterPlugin:
             self._stats["failures"] += 1
             plan = self._planner_fallback(user_message, "planner_exception")
         if self._cache_enabled and self._cache_plans:
-            self._cache.put(user_message, plan)  # cache accepts Any at runtime
+            self._cache.put(user_message, plan)
         logger.info(
             "language_router.plan task=%s user_lang=%s output_lang=%s thinking_lang=%s mode=%s confidence=%.2f",
             plan.task_type, plan.user_language, plan.final_output_language, plan.thinking_language, plan.reasoning_mode, plan.confidence,
         )
         return plan
 
-    def _parse_draft(self, parsed: dict) -> ReasoningDraft:
+    def _parse_draft(self, parsed: dict, branch_id: Optional[str] = None) -> ReasoningDraft:
         return ReasoningDraft(
             task_understanding=str(parsed.get("task_understanding") or ""),
             key_points=_as_list(parsed.get("key_points")),
@@ -422,25 +527,28 @@ class LanguageRouterPlugin:
             suggested_answer_outline=_as_list(parsed.get("suggested_answer_outline")),
             confidence=_clamp_confidence(parsed.get("confidence"), 0.5),
             raw_notes=str(parsed.get("raw_notes")) if parsed.get("raw_notes") and self._config.get("digest", {}).get("include_raw_notes") else None,
+            branch_id=branch_id,
+            branch_score=_clamp_confidence(parsed.get("branch_score", 0.5), 0.5),
         )
 
-    def _reason(self, user_message: str, plan: ReasoningPlan, path_index: int = 1) -> Optional[ReasoningDraft]:
+    def _reason(self, user_message: str, plan: ReasoningPlan, path_index: int = 1, branch_id: Optional[str] = None) -> Optional[ReasoningDraft]:
         if plan.reasoning_mode == "off" or not self._config.get("reasoner", {}).get("enabled", True):
             return None
         cfg = self._config.get("reasoner", {})
         try:
             params = _build_llm_params(cfg, 1200, 60, "language_router_reasoner")
-            payload = {"plan": plan.__dict__, "path_index": path_index, "user_message": user_message[:2000]}
+            payload = {"plan": plan.__dict__, "path_index": path_index, "branch_id": branch_id, "user_message": user_message[:2000]}
+            branch_instruction = f"Branch ID: {branch_id}. " if branch_id else ""
             result = self._ctx.llm.complete_structured(
-                instructions=(REASONER_PROMPT + f"\nThinking language: {_get_lang_name(plan.thinking_language)}.\nPlan JSON:\n{_json_for_prompt(plan)}"),
+                instructions=(REASONER_PROMPT + f"\n{branch_instruction}Thinking language: {_get_lang_name(plan.thinking_language)}.\nPlan JSON:\n{_json_for_prompt(plan)}"),
                 input=[{"type": "text", "text": json.dumps(payload, ensure_ascii=False, default=str)}],
                 json_mode=True,
                 **params,
             )
             self._stats["reasoner_calls"] += 1
             parsed = result.parsed if isinstance(getattr(result, "parsed", None), dict) else {}
-            draft = self._parse_draft(parsed)
-            logger.info("language_router.reasoner complete mode=%s confidence=%.2f", plan.reasoning_mode, draft.confidence)
+            draft = self._parse_draft(parsed, branch_id)
+            logger.info("language_router.reasoner complete mode=%s branch=%s confidence=%.2f", plan.reasoning_mode, branch_id, draft.confidence)
             return draft
         except Exception as exc:
             logger.warning("language_router.reasoner failed: %s", exc)
@@ -459,6 +567,70 @@ class LanguageRouterPlugin:
         for d in drafts:
             for field in ["key_points", "candidate_conclusions", "assumptions", "risks", "missing_information", "suggested_answer_outline"]:
                 seen = getattr(merged, field)
+                for item in getattr(d, field):
+                    if item not in seen:
+                        seen.append(item)
+        return merged
+
+    def _select_best_draft(self, drafts: list[ReasoningDraft]) -> Optional[ReasoningDraft]:
+        """Self-consistency: 选择置信度最高的草稿。"""
+        if not drafts:
+            return None
+        return max(drafts, key=lambda d: d.confidence)
+
+    def _vote_conclusions(self, drafts: list[ReasoningDraft]) -> list[str]:
+        """Self-consistency: 多数投票选择候选结论。"""
+        if not drafts:
+            return []
+        conclusion_counts: dict[str, int] = {}
+        for d in drafts:
+            for conclusion in d.candidate_conclusions:
+                conclusion_counts[conclusion] = conclusion_counts.get(conclusion, 0) + 1
+        sorted_conclusions = sorted(conclusion_counts.items(), key=lambda x: -x[1])
+        return [c for c, _ in sorted_conclusions[:5]]
+
+    def _prune_tree_branches(self, drafts: list[ReasoningDraft]) -> list[ReasoningDraft]:
+        """Tree模式: 根据置信度剪枝。"""
+        if not drafts:
+            return []
+        tree_cfg = self._config.get("reasoning", {}).get("tree", {})
+        pruning_threshold = tree_cfg.get("pruning_threshold", 0.6)
+        pruned = [d for d in drafts if d.confidence >= pruning_threshold]
+        self._stats["tree_pruned"] += len(drafts) - len(pruned)
+        logger.info("Tree pruning: %d -> %d branches (threshold=%.2f)", len(drafts), len(pruned), pruning_threshold)
+        return pruned if pruned else [max(drafts, key=lambda d: d.confidence)]
+
+    def _merge_tree_branches(self, drafts: list[ReasoningDraft]) -> Optional[ReasoningDraft]:
+        """Tree模式: 合并多个分支的结果。"""
+        if not drafts:
+            return None
+        if len(drafts) == 1:
+            return drafts[0]
+        best = max(drafts, key=lambda d: d.confidence)
+        merged = ReasoningDraft(
+            task_understanding=best.task_understanding,
+            confidence=best.confidence,
+            branch_id="merged",
+            branch_score=best.branch_score,
+        )
+        all_key_points = []
+        all_conclusions = []
+        for d in drafts:
+            all_key_points.extend(d.key_points)
+            all_conclusions.extend(d.candidate_conclusions)
+        seen_points = set()
+        for point in all_key_points:
+            if point not in seen_points:
+                merged.key_points.append(point)
+                seen_points.add(point)
+        conclusion_counts: dict[str, int] = {}
+        for c in all_conclusions:
+            conclusion_counts[c] = conclusion_counts.get(c, 0) + 1
+        sorted_conclusions = sorted(conclusion_counts.items(), key=lambda x: -x[1])
+        merged.candidate_conclusions = [c for c, _ in sorted_conclusions[:5]]
+        for field in ["assumptions", "risks", "missing_information", "suggested_answer_outline"]:
+            seen = getattr(merged, field)
+            for d in drafts:
                 for item in getattr(d, field):
                     if item not in seen:
                         seen.append(item)
@@ -484,6 +656,10 @@ class LanguageRouterPlugin:
             return None
         cfg = self._config.get("verifier", {})
         if cfg.get("enabled") is False:
+            return None
+        if self._budget_manager.should_skip_verifier():
+            self._budget_manager.add_notification("Verifier skipped due to low latency budget")
+            self._stats["budget_degradations"] += 1
             return None
         try:
             params = _build_llm_params(cfg, 700, 45, "language_router_verifier")
@@ -572,13 +748,18 @@ class LanguageRouterPlugin:
             "- Do not reveal raw internal reasoning or raw notes.",
             "[/language-router internal digest]\n",
         ])
+        budget_notifications = self._budget_manager.get_notifications()
+        if budget_notifications:
+            lines.append("Budget notifications:")
+            for notif in budget_notifications:
+                lines.append(f"- {notif}")
         lines = self._trim_lines(lines, max_tokens)
         if not lines or not lines[-1].startswith("[/language-router"):
             lines.append("[/language-router internal digest]\n")
         context = "\n".join(lines)
         debug_footer = None
         if self._config.get("debug", {}).get("show_footer"):
-            debug_footer = f"[language-router: task={plan.task_type}, user={plan.user_language}, think={plan.thinking_language}, mode={plan.reasoning_mode}, verifier={verifier_verdict}, cache=miss]"
+            debug_footer = f"[language-router: task={plan.task_type}, user={plan.user_language}, think={plan.thinking_language}, mode={plan.reasoning_mode}, verifier={verifier_verdict}, cache=miss, budget={self._budget_manager.get_degradation_level()}]"
             context += "\n" + debug_footer
         metadata = {
             "plugin": "language-router",
@@ -596,25 +777,56 @@ class LanguageRouterPlugin:
             "digest_format_version": DIGEST_FORMAT_VERSION,
             "token_estimate": self._estimate_tokens(context),
             "fallback_reason": plan.fallback_reason,
+            "budget_degradation": self._budget_manager.get_degradation_level(),
+            "budget_notifications": budget_notifications,
         }
         self._stats["digest_injections"] += 1
-        logger.info("language_router.digest injected tokens=%s mode=%s verifier=%s", metadata["token_estimate"], plan.reasoning_mode, verifier_verdict)
+        logger.info("language_router.digest injected tokens=%s mode=%s verifier=%s budget=%s", metadata["token_estimate"], plan.reasoning_mode, verifier_verdict, self._budget_manager.get_degradation_level())
         return InjectedDigest(context=context, metadata=metadata, debug_footer=debug_footer, token_estimate=metadata["token_estimate"])
 
     def on_pre_llm_call(self, user_message: str, system_prompt: str = "", **kwargs: Any) -> Optional[dict]:
         if not user_message or not user_message.strip():
             return None
+        self._budget_manager.start()
         started = time.time()
         plan = self._plan(user_message)
         self._detected_languages[plan.user_language] = self._detected_languages.get(plan.user_language, 0) + 1
         self._mode_counts[plan.reasoning_mode] = self._mode_counts.get(plan.reasoning_mode, 0) + 1
         drafts: list[ReasoningDraft] = []
         if plan.reasoning_mode != "off":
-            paths = plan.self_consistency_paths if plan.reasoning_mode == "self_consistency" else 1
-            for idx in range(paths):
-                draft = self._reason(user_message, plan, idx + 1)
-                if draft:
-                    drafts.append(draft)
+            if plan.reasoning_mode == "tree":
+                branches = plan.tree_branches
+                for idx in range(branches):
+                    branch_id = f"branch_{idx + 1}"
+                    draft = self._reason(user_message, plan, idx + 1, branch_id)
+                    if draft:
+                        drafts.append(draft)
+                        self._stats["tree_branches"] += 1
+                if drafts:
+                    drafts = self._prune_tree_branches(drafts)
+                    draft = self._merge_tree_branches(drafts)
+                    if draft:
+                        drafts = [draft]
+                self._stats["self_consistency_merges"] += 1
+            elif plan.reasoning_mode == "self_consistency":
+                paths = plan.self_consistency_paths
+                for idx in range(paths):
+                    draft = self._reason(user_message, plan, idx + 1)
+                    if draft:
+                        drafts.append(draft)
+                if drafts:
+                    best_draft = self._select_best_draft(drafts)
+                    voted_conclusions = self._vote_conclusions(drafts)
+                    if best_draft:
+                        best_draft.candidate_conclusions = voted_conclusions
+                        drafts = [best_draft]
+                    self._stats["self_consistency_merges"] += 1
+            else:
+                paths = plan.self_consistency_paths if plan.reasoning_mode == "self_consistency" else 1
+                for idx in range(paths):
+                    draft = self._reason(user_message, plan, idx + 1)
+                    if draft:
+                        drafts.append(draft)
         draft = self._merge_drafts(drafts)
         if draft and draft.confidence < self._config.get("verifier", {}).get("confidence_threshold", 0.75) and plan.reasoning_mode == "simple":
             plan.verifier_required = True
@@ -623,6 +835,7 @@ class LanguageRouterPlugin:
         digest = self._build_digest(plan, draft, verification)
         self._last_run = dict(digest.metadata)
         self._last_run["latency_seconds"] = round(time.time() - started, 3)
+        self._last_run["budget_notifications"] = self._budget_manager.get_notifications()
         return {"context": digest.context, "metadata": digest.metadata, "debug_footer": digest.debug_footer}
 
     def get_stats(self) -> dict:
@@ -639,8 +852,16 @@ class LanguageRouterPlugin:
                 "debug_show_footer": self._config.get("debug", {}).get("show_footer"),
                 "digest_max_tokens": self._config.get("digest", {}).get("max_tokens"),
                 "verifier_enabled": self._config.get("verifier", {}).get("enabled"),
+                "tree_enabled": self._config.get("reasoning", {}).get("tree", {}).get("enabled"),
+                "self_consistency_enabled": self._config.get("reasoning", {}).get("self_consistency", {}).get("enabled"),
             },
             "last_run": dict(self._last_run),
+            "budget_manager": {
+                "enabled": self._budget_manager._enabled,
+                "max_seconds": self._budget_manager._max_seconds,
+                "current_level": self._budget_manager.get_degradation_level(),
+                "remaining_ratio": self._budget_manager.get_remaining_ratio(),
+            },
         }
 
 
@@ -665,8 +886,9 @@ def _handle_stats_command(raw_args: str) -> str:
     stats = plugin.get_stats()
     cache = stats["cache"]
     last = stats.get("last_run") or {}
+    budget = stats.get("budget_manager", {})
     lines = [
-        "[language-router] Statistics (v4 Planner -> Worker -> Verifier -> Digest)",
+        "[language-router] Statistics (v4.1 Tree/Self-consistency/Cache/Budget)",
         "=" * 72,
         f"Planner calls:       {stats['planner_calls']}",
         f"Reasoner calls:      {stats['reasoner_calls']}",
@@ -674,6 +896,10 @@ def _handle_stats_command(raw_args: str) -> str:
         f"Digest injections:   {stats['digest_injections']}",
         f"Cache hits:          {stats['cache_hits']}",
         f"Failures/fallbacks:   {stats['failures']}/{stats['fallbacks']}",
+        f"Tree branches:       {stats['tree_branches']}",
+        f"Tree pruned:         {stats['tree_pruned']}",
+        f"SC merges:           {stats['self_consistency_merges']}",
+        f"Budget degradations: {stats['budget_degradations']}",
         f"Mode distribution:   {stats['mode_counts'] or {}}",
         "",
         "Cache Status:",
@@ -681,17 +907,63 @@ def _handle_stats_command(raw_args: str) -> str:
         f"  Size:     {cache['size']}/{cache['max_size']}",
         f"  Hit rate: {cache['hit_rate']:.1%}",
         "",
+        "Budget Manager:",
+        f"  Enabled:        {budget.get('enabled')}",
+        f"  Max seconds:    {budget.get('max_seconds')}",
+        f"  Current level:  {budget.get('current_level')}",
+        f"  Remaining:      {budget.get('remaining_ratio', 0):.1%}",
+        "",
         "Config Summary:",
         *[f"  {k}: {v}" for k, v in stats.get("config_summary", {}).items()],
         "",
         "Last Run:",
     ]
     if last:
-        for key in ["task_type", "user_language", "final_output_language", "thinking_language", "reasoning_mode", "verifier_verdict", "token_estimate", "latency_seconds"]:
+        for key in ["task_type", "user_language", "final_output_language", "thinking_language", "reasoning_mode", "verifier_verdict", "token_estimate", "latency_seconds", "budget_degradation"]:
             lines.append(f"  {key}: {last.get(key)}")
+        if last.get("budget_notifications"):
+            lines.append("  Budget notifications:")
+            for notif in last["budget_notifications"]:
+                lines.append(f"    - {notif}")
     else:
         lines.append("  (no runs yet)")
     return "\n".join(lines)
+
+
+def _handle_cache_command(raw_args: str) -> str:
+    plugin = _get_plugin()
+    if not plugin:
+        return "[language-router] Plugin not initialized."
+    args = raw_args.strip().split()
+    if not args:
+        return "[language-router] Usage: /language-router-cache <stats|clear|evict|warmup>"
+    subcmd = args[0].lower()
+    if subcmd == "stats":
+        cache_stats = plugin._cache.get_stats()
+        lines = [
+            "[language-router] Cache Statistics",
+            "=" * 40,
+            f"Enabled:    {plugin._cache_enabled}",
+            f"Size:       {cache_stats['size']}/{cache_stats['max_size']}",
+            f"Hit rate:   {cache_stats['hit_rate']:.1%}",
+            f"Cache plans: {plugin._cache_plans}",
+        ]
+        return "\n".join(lines)
+    elif subcmd == "clear":
+        plugin._cache.clear()
+        return "[language-router] Cache cleared."
+    elif subcmd == "evict":
+        if len(args) < 2:
+            return "[language-router] Usage: /language-router-cache evict <key>"
+        key = args[1]
+        if plugin._cache.evict(key):
+            return f"[language-router] Evicted cache entry: {key}"
+        else:
+            return f"[language-router] Key not found: {key}"
+    elif subcmd == "warmup":
+        return "[language-router] Cache warmup not yet implemented."
+    else:
+        return f"[language-router] Unknown cache subcommand: {subcmd}"
 
 
 def _handle_clear_command(raw_args: str) -> str:
@@ -706,6 +978,7 @@ def register(ctx: PluginContext) -> None:
     global _plugin_instance
     _plugin_instance = LanguageRouterPlugin(ctx)
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
-    ctx.register_command("language-router", handler=_handle_stats_command, description="Show language router v4 statistics.")
+    ctx.register_command("language-router", handler=_handle_stats_command, description="Show language router v4.1 statistics.")
+    ctx.register_command("language-router-cache", handler=_handle_cache_command, description="Manage language router cache (stats/clear/evict/warmup).")
     ctx.register_command("language-router-clear", handler=_handle_clear_command, description="Clear the language router cache.")
-    logger.info("Language Router plugin v4 registered.")
+    logger.info("Language Router plugin v4.1 registered.")

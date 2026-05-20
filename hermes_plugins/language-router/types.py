@@ -18,6 +18,7 @@ class ReasoningPlan:
     reasoning_mode: str
     verifier_required: bool
     self_consistency_paths: int
+    tree_branches: int = 3  # Tree模式分支数
     constraints: list[str] = field(default_factory=list)
     reasoning_instructions: str = ""
     fallback_reason: Optional[str] = None
@@ -34,6 +35,8 @@ class ReasoningDraft:
     suggested_answer_outline: list[str] = field(default_factory=list)
     confidence: float = 0.5
     raw_notes: Optional[str] = None
+    branch_id: Optional[str] = None  # Tree模式分支标识
+    branch_score: float = 0.0  # Tree模式分支评分
 
 
 @dataclass
