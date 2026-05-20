@@ -57,7 +57,7 @@ LANG_NAMES = {
 TECH_TASKS = {"programming", "debug", "math", "logic", "data_analysis", "data", "research", "architecture_design"}
 USER_LANG_TASKS = {"creative", "emotion", "culture"}
 VERIFIER_TASKS = TECH_TASKS | {"financial_or_medical", "legal_or_policy", "safety_sensitive"}
-ALLOWED_MODES = {"off", "simple", "verify", "self_consistency", "tree"}
+ALLOWED_MODES = {"off", "hint", "simple", "verify", "self_consistency", "tree"}
 
 DEFAULT_CONFIG = {
     "planner": {
@@ -69,16 +69,17 @@ DEFAULT_CONFIG = {
         "timeout": 15,
         "disable_reasoning_if_supported": True,
         "confidence_threshold": 0.6,
+        "heuristic_first": False,
     },
     "reasoner": {
         "enabled": True,
         "provider": None,
         "model": None,
         "temperature": 0.0,
-        "max_tokens": 1200,
-        "timeout": 60,
+        "max_tokens": 800,
+        "timeout": 35,
         "default_thinking_language": "en",
-        "reasoning_effort": "high",
+        "reasoning_effort": "medium",
     },
     "verifier": {
         "enabled": "auto",
@@ -89,32 +90,33 @@ DEFAULT_CONFIG = {
         "timeout": 45,
         "confidence_threshold": 0.75,
         "trigger_tasks": sorted(VERIFIER_TASKS),
+        "require_high_risk_or_explicit": True,
     },
     "reasoning": {
         "enabled": True,
         "mode": "auto",
-        "allowed_modes": ["off", "simple", "verify", "self_consistency", "tree"],
-        "self_consistency": {"enabled": True, "max_paths": 3, "trigger_tasks": ["math", "logic", "complex_debug"]},
-        "tree": {"enabled": True, "max_branches": 3, "pruning_threshold": 0.6, "trigger_tasks": ["math", "logic", "complex_debug", "architecture_design"]},
+        "allowed_modes": ["off", "hint", "simple", "verify", "self_consistency", "tree"],
+        "self_consistency": {"enabled": True, "max_paths": 2, "trigger_tasks": ["math", "logic", "complex_debug"]},
+        "tree": {"enabled": True, "max_branches": 2, "pruning_threshold": 0.6, "trigger_tasks": ["math", "logic", "complex_debug", "architecture_design"]},
         "expose_raw_cot": False,
         "digest_only": True,
     },
     "output": {"preserve_user_language": True, "respect_explicit_language_request": True, "fallback_language": "en"},
     "cache": {"enabled": True, "ttl_seconds": 300, "max_entries": 1000, "cache_plans": True, "cache_reasoning": False},
-    "digest": {"max_tokens": 500, "include_plan_summary": True, "include_verifier_summary": True, "include_raw_notes": False},
+    "digest": {"max_tokens": 250, "hint_max_tokens": 80, "include_plan_summary": True, "include_verifier_summary": True, "include_raw_notes": False},
     "debug": {"show_footer": False, "log_plan": True, "log_verifier": True, "log_digest_metadata": True},
     "latency_budget": {
         "enabled": True,
-        "max_total_seconds": 90,
+        "max_total_seconds": 20,
         "skip_verifier_if_budget_low": True,
         "skip_reasoner_if_budget_low": True,
         "degradation_thresholds": {"high": 0.7, "medium": 0.4, "low": 0.2},
     },
     # v5.0 新增配置
-    "multilingual_explorer": {"enabled": True, "max_languages": 4, "trigger_tasks": ["math", "logic", "complex_debug"]},
+    "multilingual_explorer": {"enabled": True, "require_explicit": True, "max_languages": 3, "trigger_tasks": ["math", "logic", "complex_debug"]},
     "dynamic_selector": {"enabled": True, "learning_rate": 0.1},
     "code_switching": {"enabled": True, "pattern_detection": True, "guidance_injection": True},
-    "reward_evaluator": {"enabled": True, "accuracy_weight": 0.5, "consistency_weight": 0.3, "fluency_weight": 0.2, "min_reward_threshold": 0.6},
+    "reward_evaluator": {"enabled": True, "require_explicit": True, "accuracy_weight": 0.5, "consistency_weight": 0.3, "fluency_weight": 0.2, "min_reward_threshold": 0.6},
     "per_request_trigger": {"enabled": True, "lightweight_reminder": True},
 }
 
@@ -251,6 +253,34 @@ def _as_list(value: Any) -> list[str]:
     return []
 
 
+def _message_text(value: Any) -> str:
+    """Extract textual content from Hermes/OpenAI multimodal message shapes."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(part for part in parts if part.strip())
+    return str(value)
+
+
+def _platform_disabled(config: dict, platform: Any) -> bool:
+    """Return True when language-router should stay out of a platform turn."""
+    platform_name = str(platform or "").strip().lower()
+    if not platform_name:
+        return False
+    disabled = _as_list((config.get("platforms") or {}).get("disabled"))
+    return platform_name in {item.strip().lower() for item in disabled}
+
+
 def _clamp_confidence(value: Any, default: float = 0.5) -> float:
     try:
         return max(0.0, min(1.0, float(value)))
@@ -347,13 +377,13 @@ class LanguageRouterPlugin:
             "planner_calls": 0, "reasoner_calls": 0, "verifier_calls": 0, "digest_injections": 0,
             "cache_hits": 0, "fallbacks": 0, "failures": 0,
             "tree_branches": 0, "tree_pruned": 0, "self_consistency_merges": 0,
-            "budget_degradations": 0,
+            "budget_degradations": 0, "post_api_requests": 0,
         }
         self._mode_counts: dict[str, int] = {}
         self._detected_languages: dict[str, int] = {}
         self._last_run: dict[str, Any] = {}
         self._budget_manager = LatencyBudgetManager(self._config)
-        # v5.0 新模块初始化
+
         self._multilingual_explorer = MultilingualThinkingExplorer(ctx, self._config.get("multilingual_explorer", {}))
         self._dynamic_selector = DynamicLanguageSelector(self._config.get("dynamic_selector", {}))
         self._code_switch_detector = CodeSwitchingPatternDetector(self._config.get("code_switching", {}))
@@ -378,6 +408,40 @@ class LanguageRouterPlugin:
             if any(w in msg for w in words):
                 return task, 0.72
         return "general", 0.55
+
+    def _is_trivial_turn(self, user_message: str) -> bool:
+        text = user_message.strip().lower()
+        if not text:
+            return True
+        if len(text) <= 12 and text in {
+            "继续", "继续吧", "go on", "continue", "ok", "好的", "好", "嗯", "是", "对", "可以", "收到",
+        }:
+            return True
+        return False
+
+    def _task_risk_and_complexity(self, task_type: str, user_message: str) -> tuple[str, str]:
+        high_stakes = {"financial_or_medical", "legal_or_policy", "safety_sensitive"}
+        if task_type in high_stakes:
+            return "high", "high"
+        if self._explicit_high_cost_allowed(user_message):
+            return "high", "high"
+        if task_type in TECH_TASKS:
+            return "medium", "medium"
+        return "low", "low"
+
+    def _should_use_planner_llm(self, user_message: str, task_type: str, confidence: float) -> bool:
+        planner_cfg = self._config.get("planner", {})
+        if not planner_cfg.get("enabled", True):
+            return False
+        if not planner_cfg.get("heuristic_first", True):
+            return True
+        if self._is_trivial_turn(user_message) or self._explicit_high_cost_allowed(user_message):
+            return False
+        threshold = float(planner_cfg.get("confidence_threshold", 0.6))
+        return confidence < threshold and task_type == "general" and len(user_message.strip()) > 80
+
+    def _deep_features_allowed(self, plan: ReasoningPlan, user_message: str) -> bool:
+        return plan.reasoning_mode in {"tree", "self_consistency"} and self._explicit_high_cost_allowed(user_message)
 
     def _resolve_thinking_language(self, task_type: str, planner_lang: str, user_lang: str, user_message: str = "") -> str:
         # v5.0: 使用动态语言选择器
@@ -409,35 +473,33 @@ class LanguageRouterPlugin:
         configured = _mode_name(reasoning_cfg.get("mode", "auto"))
         if configured in ALLOWED_MODES:
             return configured if configured in allowed else "simple"
+        if self._is_trivial_turn(user_message):
+            return "off"
 
-        # Check tree trigger_tasks
         tree_cfg = reasoning_cfg.get("tree", {})
-        if tree_cfg.get("enabled") and "tree" in allowed:
-            tree_triggers = tree_cfg.get("trigger_tasks", [])
-            if task_type in tree_triggers:
-                return "tree"
-
-        # Check self_consistency trigger_tasks
         sc_cfg = reasoning_cfg.get("self_consistency", {})
-        if sc_cfg.get("enabled") and "self_consistency" in allowed:
-            sc_triggers = sc_cfg.get("trigger_tasks", [])
-            if task_type in sc_triggers:
-                return "self_consistency"
-
-        # Explicit high-cost keywords override
-        if self._explicit_high_cost_allowed(user_message):
+        explicit_deep = self._explicit_high_cost_allowed(user_message)
+        if explicit_deep:
             if tree_cfg.get("enabled") and "tree" in allowed:
                 return "tree"
             if sc_cfg.get("enabled") and "self_consistency" in allowed:
                 return "self_consistency"
+            if "verify" in allowed:
+                return "verify"
 
-        if task_type in VERIFIER_TASKS or risk_level in {"medium", "high"} or confidence < self._config.get("verifier", {}).get("confidence_threshold", 0.75):
+        requested = _mode_name(requested_mode)
+        if requested in {"simple", "hint", "off"} and requested in allowed:
+            return requested
+
+        verifier_cfg = self._config.get("verifier", {})
+        verifier_threshold = float(verifier_cfg.get("confidence_threshold", 0.75))
+        high_risk_or_explicit = risk_level == "high" or explicit_deep
+        if high_risk_or_explicit and (task_type in VERIFIER_TASKS or confidence < verifier_threshold):
             return "verify" if "verify" in allowed else "simple"
-        if requested_mode in ALLOWED_MODES and requested_mode in allowed:
-            if requested_mode == "off":
-                return "off"
-            return requested_mode
-        return "simple" if "simple" in allowed else "off"
+
+        if task_type in TECH_TASKS or confidence >= 0.65:
+            return "simple" if "simple" in allowed else "hint"
+        return "hint" if "hint" in allowed else "off"
 
     def _explicit_high_cost_allowed(self, user_message: str) -> bool:
         return bool(re.search(r"多角度|复核|验证|算准|self[-_ ]?consistency|tree of thought|多个方案|深度分析", user_message, re.I))
@@ -446,8 +508,7 @@ class LanguageRouterPlugin:
         user_lang = _detect_language(user_message)
         explicit = _detect_explicit_output_language(user_message)
         task_type, confidence = self._heuristic_task(user_message)
-        risk = "medium" if task_type in VERIFIER_TASKS else "low"
-        complexity = "medium" if task_type in TECH_TASKS else "low"
+        risk, complexity = self._task_risk_and_complexity(task_type, user_message)
         thinking = self._resolve_thinking_language(task_type, "en" if task_type in TECH_TASKS else "user", user_lang, user_message)
         mode = self._choose_mode(task_type, confidence, risk, "auto", user_message)
         tree_cfg = self._config.get("reasoning", {}).get("tree", {})
@@ -461,7 +522,7 @@ class LanguageRouterPlugin:
             confidence=confidence,
             thinking_language=thinking,
             reasoning_mode=mode,
-            verifier_required=mode in {"verify", "self_consistency"},
+            verifier_required=mode == "verify",
             self_consistency_paths=self._self_consistency_paths(mode),
             tree_branches=self._tree_branches(mode),
             constraints=["Respect explicit output language" if explicit else "Preserve user's language"],
@@ -493,7 +554,7 @@ class LanguageRouterPlugin:
         thinking = self._resolve_thinking_language(task_type, str(parsed.get("thinking_language") or "user"), user_lang, user_message)
         mode = self._choose_mode(task_type, confidence, risk, str(parsed.get("reasoning_mode") or "auto"), user_message)
         verifier_enabled = self._config.get("verifier", {}).get("enabled", "auto")
-        verifier_required = mode in {"verify", "self_consistency"} and verifier_enabled is not False
+        verifier_required = mode == "verify" and verifier_enabled is not False
         return ReasoningPlan(
             user_language=user_lang,
             explicit_output_language=explicit,
@@ -517,9 +578,17 @@ class LanguageRouterPlugin:
             if isinstance(cached, ReasoningPlan):
                 self._stats["cache_hits"] += 1
                 return cached
+        task_type, confidence = self._heuristic_task(user_message)
+        if not self._should_use_planner_llm(user_message, task_type, confidence):
+            plan = self._planner_fallback(user_message, "heuristic_first")
+            if self._cache_enabled and self._cache_plans:
+                self._cache.put(user_message, plan)
+            logger.info(
+                "language_router.plan heuristic task=%s user_lang=%s output_lang=%s thinking_lang=%s mode=%s confidence=%.2f",
+                plan.task_type, plan.user_language, plan.final_output_language, plan.thinking_language, plan.reasoning_mode, plan.confidence,
+            )
+            return plan
         planner_cfg = self._config.get("planner", {})
-        if not planner_cfg.get("enabled", True):
-            return self._planner_fallback(user_message, "planner_disabled")
         try:
             params = _build_llm_params(planner_cfg, 300, 15, "language_router_planner")
             result = self._ctx.llm.complete_structured(
@@ -559,7 +628,11 @@ class LanguageRouterPlugin:
         )
 
     def _reason(self, user_message: str, plan: ReasoningPlan, path_index: int = 1, branch_id: Optional[str] = None) -> Optional[ReasoningDraft]:
-        if plan.reasoning_mode == "off" or not self._config.get("reasoner", {}).get("enabled", True):
+        if plan.reasoning_mode in {"off", "hint"} or not self._config.get("reasoner", {}).get("enabled", True):
+            return None
+        if self._budget_manager.should_skip_reasoner():
+            self._budget_manager.add_notification("Reasoner skipped due to low latency budget")
+            self._stats["budget_degradations"] += 1
             return None
         cfg = self._config.get("reasoner", {})
         try:
@@ -702,7 +775,7 @@ class LanguageRouterPlugin:
             report = self._parse_verification(parsed)
             # v5.0: 奖励评估器
             reward_scores: Optional[RewardScores] = None
-            if self._reward_evaluator.enabled and draft:
+            if self._reward_evaluator.enabled and draft and self._deep_features_allowed(plan, user_message):
                 try:
                     reward_scores = self._reward_evaluator.evaluate_reasoning_path(user_message, draft, plan)
                     report.accuracy_score = reward_scores.accuracy
@@ -829,7 +902,13 @@ class LanguageRouterPlugin:
         return InjectedDigest(context=context, metadata=metadata, debug_footer=debug_footer, token_estimate=metadata["token_estimate"])
 
     def on_pre_llm_call(self, user_message: str, system_prompt: str = "", **kwargs: Any) -> Optional[dict]:
+        if _platform_disabled(self._config, kwargs.get("platform")):
+            return None
+        user_message = _message_text(user_message)
         if not user_message or not user_message.strip():
+            return None
+        if self._is_trivial_turn(user_message):
+            logger.info("language_router.bypass trivial_turn")
             return None
         self._budget_manager.start()
         started = time.time()
@@ -874,7 +953,9 @@ class LanguageRouterPlugin:
         draft = self._merge_drafts(drafts)
         # v5.0: 多语言探索（在推理之后、验证之前）
         multilingual_result: Optional[MultilingualResult] = None
-        if self._multilingual_explorer.should_explore(plan.task_type, plan.reasoning_mode):
+        explorer_cfg = self._config.get("multilingual_explorer", {})
+        explorer_allowed = self._deep_features_allowed(plan, user_message) or not explorer_cfg.get("require_explicit", True)
+        if explorer_allowed and self._multilingual_explorer.should_explore(plan.task_type, plan.reasoning_mode):
             try:
                 multilingual_result = self._multilingual_explorer.explore(user_message, plan)
                 if multilingual_result and multilingual_result.merged_draft:
@@ -885,7 +966,12 @@ class LanguageRouterPlugin:
                         draft = multilingual_result.merged_draft
             except Exception as exc:
                 logger.warning("MultilingualExplorer failed: %s", exc)
-        if draft and draft.confidence < self._config.get("verifier", {}).get("confidence_threshold", 0.75) and plan.reasoning_mode == "simple":
+        if (
+            draft
+            and draft.confidence < self._config.get("verifier", {}).get("confidence_threshold", 0.75)
+            and plan.reasoning_mode == "simple"
+            and self._explicit_high_cost_allowed(user_message)
+        ):
             plan.verifier_required = True
             plan.reasoning_mode = "verify"
         verification = self._verify(user_message, plan, draft)
@@ -894,6 +980,35 @@ class LanguageRouterPlugin:
         self._last_run["latency_seconds"] = round(time.time() - started, 3)
         self._last_run["budget_notifications"] = self._budget_manager.get_notifications()
         return {"context": digest.context, "metadata": digest.metadata, "debug_footer": digest.debug_footer}
+
+    def on_post_api_request(self, **kwargs: Any) -> None:
+        """Observe completed API requests and update v5 language feedback state."""
+        self._stats["post_api_requests"] = self._stats.get("post_api_requests", 0) + 1
+        if not self._last_run:
+            return
+        finish_reason = str(kwargs.get("finish_reason") or "")
+        assistant_content_chars = int(kwargs.get("assistant_content_chars") or 0)
+        assistant_tool_call_count = int(kwargs.get("assistant_tool_call_count") or 0)
+        success = bool(finish_reason) and finish_reason not in {"error", "failed"}
+        success = success and (assistant_content_chars > 0 or assistant_tool_call_count > 0)
+        task_type = str(self._last_run.get("task_type") or "general")
+        thinking_language = str(self._last_run.get("thinking_language") or "en")
+        try:
+            self._dynamic_selector.update_performance(task_type, thinking_language, success)
+        except Exception as exc:
+            logger.warning("DynamicSelector post-api update failed: %s", exc)
+        self._last_run["last_api_finish_reason"] = finish_reason
+        self._last_run["last_api_success"] = success
+        self._last_run["last_api_duration"] = kwargs.get("api_duration")
+        logger.info(
+            "language_router.post_api_request observed finish=%s success=%s task=%s think=%s chars=%s tools=%s",
+            finish_reason,
+            success,
+            task_type,
+            thinking_language,
+            assistant_content_chars,
+            assistant_tool_call_count,
+        )
 
     def get_stats(self) -> dict:
         cache_stats = self._cache.get_stats()
@@ -945,6 +1060,8 @@ def _on_pre_api_request(**kwargs: Any) -> Optional[dict]:
     plugin = _get_plugin()
     if not plugin:
         return None
+    if _platform_disabled(plugin._config, kwargs.get("platform")):
+        return None
     api_call_count = kwargs.get("api_call_count", 0)
     if api_call_count == 0:
         return None  # 首次调用已由 pre_llm_call 处理
@@ -959,6 +1076,13 @@ def _on_pre_api_request(**kwargs: Any) -> Optional[dict]:
     thinking_lang = last.get("thinking_language", "en")
     lang_name = LANG_NAMES.get(thinking_lang, thinking_lang)
     return {"context": f"\n[Language Router] Maintain {lang_name} ({thinking_lang}) reasoning language."}
+
+
+def _on_post_api_request(**kwargs: Any) -> None:
+    """v5.0: observe completed API requests for language feedback."""
+    plugin = _get_plugin()
+    if plugin:
+        plugin.on_post_api_request(**kwargs)
 
 
 def _handle_stats_command(raw_args: str) -> str:
@@ -982,6 +1106,7 @@ def _handle_stats_command(raw_args: str) -> str:
         f"Tree pruned:         {stats['tree_pruned']}",
         f"SC merges:           {stats['self_consistency_merges']}",
         f"Budget degradations: {stats['budget_degradations']}",
+        f"Post API requests:  {stats.get('post_api_requests', 0)}",
         f"Multilingual explores: {stats.get('multilingual_explorations', 0)}",
         f"Reward evaluations:   {stats.get('reward_evaluations', 0)}",
         f"Mode distribution:   {stats['mode_counts'] or {}}",
@@ -1063,6 +1188,7 @@ def register(ctx: PluginContext) -> None:
     _plugin_instance = LanguageRouterPlugin(ctx)
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
     ctx.register_hook("pre_api_request", _on_pre_api_request)
+    ctx.register_hook("post_api_request", _on_post_api_request)
     ctx.register_command("language-router", handler=_handle_stats_command, description="Show language router v5.0 statistics.")
     ctx.register_command("language-router-cache", handler=_handle_cache_command, description="Manage language router cache (stats/clear/evict/warmup).")
     ctx.register_command("language-router-clear", handler=_handle_clear_command, description="Clear the language router cache.")
