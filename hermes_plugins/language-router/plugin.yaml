@@ -1,9 +1,11 @@
 name: language-router
-version: 4.1.0
-description: "Language Router Plugin v4.1 — Planner -> Worker -> Verifier -> Digest with Tree/Self-consistency/Cache/Budget"
+version: 5.0.0
+description: "Language Router Plugin v5.0 — Planner -> Worker -> Verifier -> Digest with Tree/Self-consistency/Cache/Budget + Multilingual Explorer + Dynamic Selector + Code-Switch Detector + Reward Evaluator"
 author: "Diana (NousResearch)"
 hooks:
   - pre_llm_call
+  - pre_api_request
+  - post_api_request
 default_config:
   planner:
     enabled: true
@@ -87,3 +89,39 @@ default_config:
       high: 0.7
       medium: 0.4
       low: 0.2
+  # ── v5.0 新增配置 ──
+  multilingual_explorer:
+    enabled: true
+    max_languages: 4
+    trigger_tasks:
+      - math
+      - logic
+      - complex_debug
+    language_affinity:
+      math: ["zh", "ja"]
+      logic: ["de", "fr"]
+      complex_debug: ["zh", "ja"]
+      programming: ["en", "zh"]
+  dynamic_selector:
+    enabled: true
+    learning_rate: 0.1
+    initial_scores:
+      en: 0.7
+      zh: 0.6
+      ja: 0.5
+      de: 0.5
+      fr: 0.5
+  code_switching:
+    enabled: true
+    pattern_detection: true
+    guidance_injection: true
+  per_request_trigger:
+    enabled: true
+    lightweight_reminder: true
+    max_latency_ms: 10
+  reward_evaluator:
+    enabled: true
+    accuracy_weight: 0.5
+    consistency_weight: 0.3
+    fluency_weight: 0.2
+    min_reward_threshold: 0.6

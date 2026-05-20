@@ -1,4 +1,4 @@
-"""Structured data contracts for language-router v4."""
+"""Structured data contracts for language-router v5."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -57,3 +57,23 @@ class InjectedDigest:
     metadata: dict[str, Any]
     debug_footer: Optional[str]
     token_estimate: int
+
+
+# ── v5.0 新增数据类 ──────────────────────────────────────────
+
+
+@dataclass
+class RewardScores:
+    """Reward-based evaluation scores (Improvement #7)."""
+    accuracy: float = 0.5
+    consistency: float = 0.5
+    fluency: float = 0.5
+    overall_reward: float = 0.5
+
+
+@dataclass
+class MultilingualResult:
+    """Result from Multilingual Thinking Explorer (Improvement #3)."""
+    languages: list[str] = field(default_factory=list)
+    merged_draft: Optional[ReasoningDraft] = None
+    per_language_confidence: dict[str, float] = field(default_factory=dict)

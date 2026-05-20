@@ -1,4 +1,4 @@
-"""Language Router Plugin v4.1 — Planner -> Worker -> Verifier -> Digest with Tree/Self-consistency/Cache/Budget."""
+"""Language Router Plugin v5.0 — Planner -> Worker -> Verifier -> Digest with Tree/Self-consistency/Cache/Budget + Multilingual Explorer + Dynamic Selector + Code-Switch Detector + Reward Evaluator."""
 from __future__ import annotations
 
 import json
@@ -21,11 +21,15 @@ from .prompts import (
     VERIFIER_PROMPT,
     VERIFIER_PROMPT_VERSION,
 )
-from .types import InjectedDigest, ReasoningDraft, ReasoningPlan, VerificationReport
+from .types import InjectedDigest, ReasoningDraft, ReasoningPlan, VerificationReport, RewardScores, MultilingualResult
+from .multilingual_explorer import MultilingualThinkingExplorer
+from .dynamic_selector import DynamicLanguageSelector
+from .code_switch_detector import CodeSwitchingPatternDetector
+from .reward_evaluator import RewardBasedEvaluator
 
 logger = logging.getLogger(__name__)
 
-VERSION = "4.1.0"
+VERSION = "5.0.0"
 
 LANG_PATTERNS = {
     "ja_hiragana": re.compile(r"[\u3040-\u309f]"),
@@ -106,6 +110,12 @@ DEFAULT_CONFIG = {
         "skip_reasoner_if_budget_low": True,
         "degradation_thresholds": {"high": 0.7, "medium": 0.4, "low": 0.2},
     },
+    # v5.0 新增配置
+    "multilingual_explorer": {"enabled": True, "max_languages": 4, "trigger_tasks": ["math", "logic", "complex_debug"]},
+    "dynamic_selector": {"enabled": True, "learning_rate": 0.1},
+    "code_switching": {"enabled": True, "pattern_detection": True, "guidance_injection": True},
+    "reward_evaluator": {"enabled": True, "accuracy_weight": 0.5, "consistency_weight": 0.3, "fluency_weight": 0.2, "min_reward_threshold": 0.6},
+    "per_request_trigger": {"enabled": True, "lightweight_reminder": True},
 }
 
 
@@ -324,7 +334,7 @@ class LatencyBudgetManager:
 
 
 class LanguageRouterPlugin:
-    """Structured language-router v4.1 pipeline with Tree/Self-consistency/Cache/Budget."""
+    """Structured language-router v5.0 pipeline with Tree/Self-consistency/Cache/Budget + Multilingual Explorer + Dynamic Selector + Code-Switch Detector + Reward Evaluator."""
 
     def __init__(self, ctx: PluginContext):
         self._ctx = ctx
@@ -343,7 +353,13 @@ class LanguageRouterPlugin:
         self._detected_languages: dict[str, int] = {}
         self._last_run: dict[str, Any] = {}
         self._budget_manager = LatencyBudgetManager(self._config)
-        logger.info("Language Router v4.1 initialized config=%s", self._config)
+        # v5.0 新模块初始化
+        self._multilingual_explorer = MultilingualThinkingExplorer(ctx, self._config.get("multilingual_explorer", {}))
+        self._dynamic_selector = DynamicLanguageSelector(self._config.get("dynamic_selector", {}))
+        self._code_switch_detector = CodeSwitchingPatternDetector(self._config.get("code_switching", {}))
+        self._reward_evaluator = RewardBasedEvaluator(ctx, self._config.get("reward_evaluator", {}))
+        self._api_call_count = 0
+        logger.info("Language Router v5.0 initialized config=%s", self._config)
 
     def _heuristic_task(self, user_message: str) -> tuple[str, float]:
         msg = user_message.lower()
@@ -363,7 +379,18 @@ class LanguageRouterPlugin:
                 return task, 0.72
         return "general", 0.55
 
-    def _resolve_thinking_language(self, task_type: str, planner_lang: str, user_lang: str) -> str:
+    def _resolve_thinking_language(self, task_type: str, planner_lang: str, user_lang: str, user_message: str = "") -> str:
+        # v5.0: 使用动态语言选择器
+        if self._dynamic_selector._config.get("enabled", True):
+            try:
+                lang, conf = self._dynamic_selector.select_optimal_language(
+                    task_type, user_message or "", user_lang,
+                )
+                logger.info("DynamicSelector: selected=%s confidence=%.2f for task=%s", lang, conf, task_type)
+                return lang
+            except Exception as exc:
+                logger.warning("DynamicSelector failed: %s, falling back to rules", exc)
+        # 原有规则 fallback
         if planner_lang == "source":
             return user_lang
         if planner_lang == "user":
@@ -421,7 +448,7 @@ class LanguageRouterPlugin:
         task_type, confidence = self._heuristic_task(user_message)
         risk = "medium" if task_type in VERIFIER_TASKS else "low"
         complexity = "medium" if task_type in TECH_TASKS else "low"
-        thinking = self._resolve_thinking_language(task_type, "en" if task_type in TECH_TASKS else "user", user_lang)
+        thinking = self._resolve_thinking_language(task_type, "en" if task_type in TECH_TASKS else "user", user_lang, user_message)
         mode = self._choose_mode(task_type, confidence, risk, "auto", user_message)
         tree_cfg = self._config.get("reasoning", {}).get("tree", {})
         return ReasoningPlan(
@@ -463,7 +490,7 @@ class LanguageRouterPlugin:
         confidence = _clamp_confidence(parsed.get("confidence"), 0.5)
         risk = str(parsed.get("risk_level") or ("medium" if task_type in VERIFIER_TASKS else "low"))
         complexity = str(parsed.get("task_complexity") or ("medium" if task_type in TECH_TASKS else "low"))
-        thinking = self._resolve_thinking_language(task_type, str(parsed.get("thinking_language") or "user"), user_lang)
+        thinking = self._resolve_thinking_language(task_type, str(parsed.get("thinking_language") or "user"), user_lang, user_message)
         mode = self._choose_mode(task_type, confidence, risk, str(parsed.get("reasoning_mode") or "auto"), user_message)
         verifier_enabled = self._config.get("verifier", {}).get("enabled", "auto")
         verifier_required = mode in {"verify", "self_consistency"} and verifier_enabled is not False
@@ -673,7 +700,19 @@ class LanguageRouterPlugin:
             self._stats["verifier_calls"] += 1
             parsed = result.parsed if isinstance(getattr(result, "parsed", None), dict) else {}
             report = self._parse_verification(parsed)
-            logger.info("language_router.verifier verdict=%s issues=%d confidence=%.2f", report.verdict, len(report.issues), report.confidence)
+            # v5.0: 奖励评估器
+            reward_scores: Optional[RewardScores] = None
+            if self._reward_evaluator.enabled and draft:
+                try:
+                    reward_scores = self._reward_evaluator.evaluate_reasoning_path(user_message, draft, plan)
+                    report.accuracy_score = reward_scores.accuracy
+                    if self._reward_evaluator.should_reject(reward_scores):
+                        report.verdict = "reject"
+                        report.issues.append(f"Low reward score: {reward_scores.overall_reward:.2f}")
+                    self._stats["reward_evaluations"] = self._stats.get("reward_evaluations", 0) + 1
+                except Exception as exc:
+                    logger.warning("RewardEvaluator failed: %s", exc)
+            logger.info("language_router.verifier verdict=%s issues=%d confidence=%.2f reward=%s", report.verdict, len(report.issues), report.confidence, reward_scores.overall_reward if reward_scores else "N/A")
             return report
         except Exception as exc:
             logger.warning("language_router.verifier failed: %s", exc)
@@ -779,6 +818,11 @@ class LanguageRouterPlugin:
             "fallback_reason": plan.fallback_reason,
             "budget_degradation": self._budget_manager.get_degradation_level(),
             "budget_notifications": budget_notifications,
+            "plugin_version": VERSION,
+            "dynamic_selector_enabled": self._dynamic_selector._config.get("enabled", True),
+            "multilingual_explorer_enabled": self._multilingual_explorer._config.get("enabled", True),
+            "code_switch_detector_enabled": self._code_switch_detector.enabled,
+            "reward_evaluator_enabled": self._reward_evaluator.enabled,
         }
         self._stats["digest_injections"] += 1
         logger.info("language_router.digest injected tokens=%s mode=%s verifier=%s budget=%s", metadata["token_estimate"], plan.reasoning_mode, verifier_verdict, self._budget_manager.get_degradation_level())
@@ -828,6 +872,19 @@ class LanguageRouterPlugin:
                     if draft:
                         drafts.append(draft)
         draft = self._merge_drafts(drafts)
+        # v5.0: 多语言探索（在推理之后、验证之前）
+        multilingual_result: Optional[MultilingualResult] = None
+        if self._multilingual_explorer.should_explore(plan.task_type, plan.reasoning_mode):
+            try:
+                multilingual_result = self._multilingual_explorer.explore(user_message, plan)
+                if multilingual_result and multilingual_result.merged_draft:
+                    logger.info("MultilingualExplorer: merged %d language drafts", len(multilingual_result.languages))
+                    self._stats["multilingual_explorations"] = self._stats.get("multilingual_explorations", 0) + 1
+                    # 用多语言合并结果增强 draft（如果置信度更高）
+                    if multilingual_result.merged_draft.confidence > (draft.confidence if draft else 0):
+                        draft = multilingual_result.merged_draft
+            except Exception as exc:
+                logger.warning("MultilingualExplorer failed: %s", exc)
         if draft and draft.confidence < self._config.get("verifier", {}).get("confidence_threshold", 0.75) and plan.reasoning_mode == "simple":
             plan.verifier_required = True
             plan.reasoning_mode = "verify"
@@ -854,6 +911,10 @@ class LanguageRouterPlugin:
                 "verifier_enabled": self._config.get("verifier", {}).get("enabled"),
                 "tree_enabled": self._config.get("reasoning", {}).get("tree", {}).get("enabled"),
                 "self_consistency_enabled": self._config.get("reasoning", {}).get("self_consistency", {}).get("enabled"),
+                "multilingual_explorer_enabled": self._multilingual_explorer._config.get("enabled", True),
+                "dynamic_selector_enabled": self._dynamic_selector._config.get("enabled", True),
+                "code_switch_detector_enabled": self._code_switch_detector.enabled,
+                "reward_evaluator_enabled": self._reward_evaluator.enabled,
             },
             "last_run": dict(self._last_run),
             "budget_manager": {
@@ -879,6 +940,27 @@ def _on_pre_llm_call(**kwargs: Any) -> Optional[dict]:
     return None
 
 
+def _on_pre_api_request(**kwargs: Any) -> Optional[dict]:
+    """v5.0: 在每次 API 请求前注入语言提醒（per-request trigger）。"""
+    plugin = _get_plugin()
+    if not plugin:
+        return None
+    api_call_count = kwargs.get("api_call_count", 0)
+    if api_call_count == 0:
+        return None  # 首次调用已由 pre_llm_call 处理
+    session_id = kwargs.get("session_id", "")
+    # 注入轻量级语言维持提醒
+    per_request_cfg = plugin._config.get("per_request_trigger", {})
+    if not per_request_cfg.get("enabled", True):
+        return None
+    last = plugin._last_run
+    if not last:
+        return None
+    thinking_lang = last.get("thinking_language", "en")
+    lang_name = LANG_NAMES.get(thinking_lang, thinking_lang)
+    return {"context": f"\n[Language Router] Maintain {lang_name} ({thinking_lang}) reasoning language."}
+
+
 def _handle_stats_command(raw_args: str) -> str:
     plugin = _get_plugin()
     if not plugin:
@@ -888,7 +970,7 @@ def _handle_stats_command(raw_args: str) -> str:
     last = stats.get("last_run") or {}
     budget = stats.get("budget_manager", {})
     lines = [
-        "[language-router] Statistics (v4.1 Tree/Self-consistency/Cache/Budget)",
+        "[language-router] Statistics (v5.0 with Multilingual Explorer + Dynamic Selector + Code-Switch Detector + Reward Evaluator)",
         "=" * 72,
         f"Planner calls:       {stats['planner_calls']}",
         f"Reasoner calls:      {stats['reasoner_calls']}",
@@ -900,6 +982,8 @@ def _handle_stats_command(raw_args: str) -> str:
         f"Tree pruned:         {stats['tree_pruned']}",
         f"SC merges:           {stats['self_consistency_merges']}",
         f"Budget degradations: {stats['budget_degradations']}",
+        f"Multilingual explores: {stats.get('multilingual_explorations', 0)}",
+        f"Reward evaluations:   {stats.get('reward_evaluations', 0)}",
         f"Mode distribution:   {stats['mode_counts'] or {}}",
         "",
         "Cache Status:",
@@ -919,7 +1003,7 @@ def _handle_stats_command(raw_args: str) -> str:
         "Last Run:",
     ]
     if last:
-        for key in ["task_type", "user_language", "final_output_language", "thinking_language", "reasoning_mode", "verifier_verdict", "token_estimate", "latency_seconds", "budget_degradation"]:
+        for key in ["task_type", "user_language", "final_output_language", "thinking_language", "reasoning_mode", "verifier_verdict", "token_estimate", "latency_seconds", "budget_degradation", "reward_evaluation"]:
             lines.append(f"  {key}: {last.get(key)}")
         if last.get("budget_notifications"):
             lines.append("  Budget notifications:")
@@ -978,7 +1062,8 @@ def register(ctx: PluginContext) -> None:
     global _plugin_instance
     _plugin_instance = LanguageRouterPlugin(ctx)
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
-    ctx.register_command("language-router", handler=_handle_stats_command, description="Show language router v4.1 statistics.")
+    ctx.register_hook("pre_api_request", _on_pre_api_request)
+    ctx.register_command("language-router", handler=_handle_stats_command, description="Show language router v5.0 statistics.")
     ctx.register_command("language-router-cache", handler=_handle_cache_command, description="Manage language router cache (stats/clear/evict/warmup).")
     ctx.register_command("language-router-clear", handler=_handle_clear_command, description="Clear the language router cache.")
-    logger.info("Language Router plugin v4.1 registered.")
+    logger.info("Language Router plugin v5.0 registered.")
