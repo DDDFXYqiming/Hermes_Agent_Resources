@@ -80,6 +80,8 @@ class TranscribeOutput:
     visual_frames: List[dict] = field(default_factory=list)
     visual_manifest_file: str = ""
     notes_md: str = ""  # 由 Agent 填充的 Markdown 笔记
+    chunk_summaries_file: str = ""
+    final_notes_file: str = ""
 
 # ============================================================
 # 工具函数
@@ -108,6 +110,10 @@ FFMPEG = os.getenv("FFMPEG") or shutil.which("ffmpeg") or "ffmpeg"
 WHISPER_CPP_PATH = os.getenv("WHISPER_CPP", "")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base").lower()
 TRANSCRIBER_TYPE = os.getenv("TRANSCRIBER_TYPE", "faster-whisper").lower()
+TRANSCRIPT_CHUNK_CHARS = int(os.getenv("VIDEO_NOTES_TRANSCRIPT_CHUNK_CHARS", "3200"))
+NOTES_TRANSCRIPT_PREVIEW_CHARS = int(os.getenv("VIDEO_NOTES_TRANSCRIPT_PREVIEW_CHARS", "1200"))
+MAX_AGENT_FRAMES = int(os.getenv("VIDEO_NOTES_MAX_AGENT_FRAMES", "3"))
+FRAME_MAX_WIDTH = int(os.getenv("VIDEO_NOTES_FRAME_MAX_WIDTH", "640"))
 
 
 def runtime_path(*parts):
@@ -428,6 +434,78 @@ def find_nearby_transcript(segments: List[dict], timestamp: float, window: float
                 nearby.append(text)
     return " ".join(nearby)[:500]
 
+
+def compact_text(text: str, limit: int) -> str:
+    text = " ".join(str(text or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "..."
+
+
+def chunk_transcript_segments(segments: List[dict], max_chars: int = TRANSCRIPT_CHUNK_CHARS) -> List[dict]:
+    chunks = []
+    current = []
+    current_len = 0
+    max_chars = max(800, int(max_chars or TRANSCRIPT_CHUNK_CHARS))
+
+    for segment in segments:
+        text = " ".join(str(segment.get("text", "")).split())
+        if not text:
+            continue
+        projected = current_len + len(text) + 1
+        if current and projected > max_chars:
+            chunks.append({"segments": current})
+            current = []
+            current_len = 0
+        current.append(segment)
+        current_len += len(text) + 1
+
+    if current:
+        chunks.append({"segments": current})
+
+    for index, chunk in enumerate(chunks, start=1):
+        chunk_segments = chunk["segments"]
+        text = " ".join(str(s.get("text", "")).strip() for s in chunk_segments if str(s.get("text", "")).strip())
+        chunk["index"] = index
+        chunk["start"] = float(chunk_segments[0].get("start", 0) or 0)
+        chunk["end"] = float(chunk_segments[-1].get("end", chunk["start"]) or chunk["start"])
+        chunk["text"] = text
+        chunk["char_count"] = len(text)
+    return chunks
+
+
+def build_chunk_summaries_markdown(output: TranscribeOutput, safe_id: str) -> str:
+    info = output.video_info or {}
+    title = info.get("title") or safe_id
+    chunks = chunk_transcript_segments(output.segments)
+
+    lines = [
+        f"# {title} - chunk summaries",
+        "",
+        "This file is intentionally compact. Use it before reading full transcript JSON.",
+        "",
+        f"- Source: {output.source or 'unknown'}",
+        f"- SegmentCount: {len(output.segments)}",
+        f"- ChunkCount: {len(chunks)}",
+        f"- ChunkCharBudget: {TRANSCRIPT_CHUNK_CHARS}",
+        "",
+    ]
+
+    if not chunks:
+        lines.append("No transcript chunks available.")
+        return "\n".join(lines).rstrip() + "\n"
+
+    for chunk in chunks:
+        lines.extend([
+            f"## Chunk {chunk['index']} [{format_timestamp(chunk['start'])}-{format_timestamp(chunk['end'])}]",
+            "",
+            f"- Segments: {len(chunk['segments'])}",
+            f"- Characters: {chunk['char_count']}",
+            f"- Digest: {compact_text(chunk['text'], 900)}",
+            "",
+        ])
+    return "\n".join(lines).rstrip() + "\n"
+
 # ============================================================
 # 视频信息 + 字幕获取
 # ============================================================
@@ -554,7 +632,7 @@ def extract_visual_frames(video_path: str, output_dir: str, safe_id: str, durati
 
     duration = float(duration or 0)
     frame_interval = max(1.0, float(frame_interval or 30.0))
-    max_frames = max(1, int(max_frames or 8))
+    max_frames = min(MAX_AGENT_FRAMES, max(1, int(max_frames or 8)))
 
     if duration > 0:
         timestamps = []
@@ -575,7 +653,8 @@ def extract_visual_frames(video_path: str, output_dir: str, safe_id: str, durati
             "-ss", f"{timestamp:.3f}",
             "-i", video_path,
             "-frames:v", "1",
-            "-q:v", "3",
+            "-vf", f"scale='min({FRAME_MAX_WIDTH},iw)':-2",
+            "-q:v", "7",
             image_path,
         ]
         result = run_command(cmd, timeout=120, env=command_env())
@@ -616,7 +695,9 @@ def build_notes_markdown(output: TranscribeOutput, safe_id: str) -> str:
     if tags:
         lines.append(f"- 标签：{', '.join(str(tag) for tag in tags)}")
     if output.visual_frames:
-        lines.append(f"- 视觉帧：{len(output.visual_frames)} 张")
+        lines.append(f"- 视觉帧：{len(output.visual_frames)} 张（已限制为低上下文预算）")
+    if output.chunk_summaries_file:
+        lines.append(f"- 分块摘要：`{output.chunk_summaries_file}`")
     lines.extend(["", "## 一句话总结", ""])
 
     if output.transcript_text:
@@ -641,7 +722,8 @@ def build_notes_markdown(output: TranscribeOutput, safe_id: str) -> str:
             lines.extend([
                 f"### {ts}",
                 "",
-                f"![{ts}]({rel_path})" if image_path else "",
+                f"- Frame path: `{rel_path}`" if image_path else "",
+                "- Do not batch-open frames. Inspect at most one image per model request.",
                 "",
             ])
             if visual_note:
@@ -673,14 +755,20 @@ def build_notes_markdown(output: TranscribeOutput, safe_id: str) -> str:
     else:
         lines.append("- 暂无字幕/转写内容。")
 
-    lines.extend(["", "## 完整转写", ""])
+    lines.extend(["", "## 转写预览", ""])
     if output.transcript_text:
-        lines.append(output.transcript_text.strip())
+        lines.append(compact_text(output.transcript_text, NOTES_TRANSCRIPT_PREVIEW_CHARS))
+        lines.append("")
+        lines.append("完整转写仅保存在结构化 JSON 中。为了避免 Claude Code 上下文溢出，默认不要整文件读取；先读分块摘要。")
     else:
         lines.append("暂无完整转写。")
 
     if output.visual_manifest_file:
         lines.extend(["", "## 关联文件", "", f"- 视觉清单：`{output.visual_manifest_file}`"])
+    if output.chunk_summaries_file:
+        lines.append(f"- 分块摘要：`{output.chunk_summaries_file}`")
+    if output.final_notes_file:
+        lines.append(f"- 最终笔记：`{output.final_notes_file}`")
     if output.output_file:
         lines.append(f"- 结构化数据：`{output.output_file}`")
 
@@ -813,15 +901,31 @@ def generate_transcript(url: str, output_dir: str = "./notes",
                 json.dump({
                     "video_info": output.video_info,
                     "frames": output.visual_frames,
-                    "instruction": "Use native multimodal image understanding to inspect these frames. Do not OCR or transcribe on-screen text as the primary method.",
+                    "agent_read_policy": {
+                        "text_first": True,
+                        "max_images_per_model_request": 1,
+                        "default_image_action": "Do not open images unless visual evidence is required.",
+                        "fallback": "If image input is unavailable or context is tight, use timestamp and nearby_transcript only."
+                    },
+                    "instruction": "Use native multimodal image understanding only one frame at a time. Never send all frames plus transcript together. If image input is unavailable, use OCR only as fallback and label it OCR-derived.",
                 }, f, ensure_ascii=False, indent=2)
 
     output_file = os.path.join(output_dir, f"{safe_id}_transcript.json")
+    chunk_summaries_file = os.path.join(output_dir, f"{safe_id}_chunk_summaries.md")
+    final_notes_file = os.path.join(output_dir, f"{safe_id}_final_notes.md")
 
     output.output_file = output_file
+    output.chunk_summaries_file = chunk_summaries_file
+    output.final_notes_file = final_notes_file
+    chunk_summaries_md = build_chunk_summaries_markdown(output, safe_id)
+    with open(chunk_summaries_file, "w", encoding="utf-8") as f:
+        f.write(chunk_summaries_md)
+
     output.notes_md = build_notes_markdown(output, safe_id)
     notes_file = os.path.join(output_dir, f"{safe_id}_notes.md")
     with open(notes_file, "w", encoding="utf-8") as f:
+        f.write(output.notes_md)
+    with open(final_notes_file, "w", encoding="utf-8") as f:
         f.write(output.notes_md)
 
     output_data = asdict(output)
@@ -839,8 +943,10 @@ def generate_transcript(url: str, output_dir: str = "./notes",
     print(f"  信息来源: {output.source}", file=sys.stderr)
     if output.segments:
         print(f"  段落数: {len(output.segments)}", file=sys.stderr)
+        print(f"  分块摘要: {chunk_summaries_file}", file=sys.stderr)
     print(f"  输出: {output_file}", file=sys.stderr)
     print(f"  笔记: {notes_file}", file=sys.stderr)
+    print(f"  最终笔记: {final_notes_file}", file=sys.stderr)
     print(f"{'='*60}", file=sys.stderr)
     return output
 
@@ -867,7 +973,8 @@ def main():
     parser.add_argument("--model", default=None, help="whisper.cpp 模型 (默认读取 WHISPER_MODEL 环境变量或 base)")
     parser.add_argument("--frames", action="store_true", help="抽取视频画面帧并输出视觉清单，供多模态模型原生读图")
     parser.add_argument("--frame-interval", type=float, default=30.0, help="抽帧间隔秒数，默认 30")
-    parser.add_argument("--max-frames", type=int, default=8, help="最多抽取帧数，默认 8")
+    parser.add_argument("--max-frames", type=int, default=MAX_AGENT_FRAMES, help=f"最多抽取帧数，默认 {MAX_AGENT_FRAMES}")
+    parser.add_argument("--print-full-json", action="store_true", help="危险：在 stdout 打印完整 JSON。默认只打印短摘要，避免 Claude Code 上下文溢出")
     args = parser.parse_args()
 
     global WHISPER_MODEL
@@ -884,7 +991,20 @@ def main():
             frame_interval=args.frame_interval,
             max_frames=args.max_frames,
         )
-        print(json.dumps(asdict(output), ensure_ascii=False, indent=2))
+        if args.print_full_json:
+            print(json.dumps(asdict(output), ensure_ascii=False, indent=2))
+        else:
+            print(json.dumps({
+                "ok": True,
+                "source": output.source,
+                "segment_count": len(output.segments),
+                "frame_count": len(output.visual_frames),
+                "transcript_json": output.output_file,
+                "chunk_summaries": output.chunk_summaries_file,
+                "final_notes": output.final_notes_file,
+                "visual_manifest": output.visual_manifest_file,
+                "read_policy": "Read final_notes and chunk_summaries first. Do not read full transcript JSON or batch-open images unless explicitly needed.",
+            }, ensure_ascii=False, indent=2))
         return 0
     except Exception as e:
         print(f"\n[error] 失败: {e}", file=sys.stderr)

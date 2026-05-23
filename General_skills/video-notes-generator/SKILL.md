@@ -117,6 +117,21 @@ When the user asks for image-aware video analysis and the active model supports 
 
 The script writes `*_notes.md` as the integrated user-facing note. It keeps `visual_note` blank in JSON on purpose; the agent/model should inspect the actual image files when native multimodal input is available, or use OCR fallback only when image input is unavailable.
 
+## Context-Safe Workflow
+
+The script is designed to avoid Claude Code context overflow:
+
+1. Read `*_final_notes.md` first for the user-facing result.
+2. Read `*_chunk_summaries.md` before opening `*_transcript.json`.
+3. Do not read the full transcript JSON unless the user explicitly asks for raw transcript details.
+4. If more detail is needed, inspect one transcript chunk or one timestamp range at a time.
+5. Treat `*_visual_manifest.json` as a compact frame index. Do not open images by default.
+6. If visual evidence is required, open at most one frame per model request, summarize it, then continue. Never send multiple images plus transcript together.
+7. If a model/API returns a context-window error, retry from `*_chunk_summaries.md` and `*_final_notes.md`; do not resend raw transcript, OCR, and frames together.
+
+The full transcript remains available in `*_transcript.json`, but it is an archive artifact, not the default prompt input.
+The CLI prints a short JSON summary by default. Do not use `--print-full-json` inside Claude Code unless the user explicitly asks for raw JSON output.
+
 ## Common Pitfalls
 
 1. **Missing OPENAI_API_KEY**: Set it in `.env` or `export` before running. The LLM call will fail without it.
@@ -133,10 +148,13 @@ The script writes `*_notes.md` as the integrated user-facing note. It keeps `vis
 After running, verify:
 - [ ] Output `.md` integrated notes file exists in `NOTE_OUTPUT_DIR`
 - [ ] Output `.json` transcript file exists for programmatic reuse
+- [ ] Output `*_chunk_summaries.md` exists and is read before full transcript JSON
+- [ ] Output `*_final_notes.md` exists for user-facing notes
 - [ ] Markdown renders correctly (no broken formatting)
 - [ ] Timestamps (`*Content-[mm:ss]`) are present if `link` format was selected
 - [ ] Frames directory contains images if `--frames` / `screenshot` format was selected
 - [ ] `*_visual_manifest.json` points to existing image files when frames were extracted
+- [ ] No more than one frame is passed into any single model request unless the user explicitly asks for deeper visual inspection
 - [ ] Native multimodal visual notes are used when image input is supported; OCR fallback is marked if used
 - [ ] AI summary section exists if `summary` format was selected
 - [ ] No error messages in terminal output
