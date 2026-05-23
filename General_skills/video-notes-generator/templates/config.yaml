@@ -1,46 +1,43 @@
-# Video Notes Generator - Advanced Configuration
-# Copy this file to config.yaml and customize as needed.
+# Video Notes Generator - Current script configuration notes
+# The current video_to_notes.py script is configured by CLI flags and environment variables.
+# It does not read this YAML file directly; keep this file as a human reference only.
 
-# --- LLM Settings ---
-llm:
-  # OpenAI-compatible API settings
-  api_key: "${OPENAI_API_KEY}"        # Or set via environment variable
-  base_url: "https://api.openai.com/v1"
-  model: "gpt-4o-mini"                # Model to use for note generation
-  temperature: 0.7                     # Lower = more focused, higher = more creative
-  max_tokens: 4096                     # Max tokens per LLM response
+cli:
+  usage: 'python scripts/video_to_notes.py "<video-url-or-local-file>" -o ./notes --frames --frame-interval 30 --max-frames 3'
+  unsupported_flags:
+    - --url
+    - --file
+    - --style
+    - --format
+    - --quality
 
-# --- Transcription Settings ---
-transcriber:
-  type: "fast-whisper"                 # fast-whisper, groq, bcut, kuaishou, mlx-whisper
-  whisper:
-    model_size: "base"                 # tiny, base, small, medium, large-v3
-    device: "auto"                     # auto, cuda, cpu (auto detects GPU)
-  groq:
-    api_key: "${GROQ_API_KEY}"
-    model: "whisper-large-v3-turbo"
+paths:
+  ytdlp_env: YTDLP
+  ffmpeg_env: FFMPEG
+  runtime_dir_env: VIDEO_NOTES_RUNTIME_DIR
+  env_file_env: VIDEO_NOTES_ENV
 
-# --- Download Settings ---
-download:
-  quality: "fast"                      # fast, normal, high
-  output_dir: "./cache"                # Temporary download cache
-  cookies:
-    bilibili: ""                       # Bilibili cookie string (SESSDATA=xxx; bili_jct=xxx)
-    youtube: ""                        # YouTube cookies file path (Netscape format)
+transcription:
+  transcriber_type_env: TRANSCRIBER_TYPE
+  whisper_cpp_env: WHISPER_CPP
+  whisper_model_env: WHISPER_MODEL
 
-# --- Output Settings ---
 output:
-  dir: "./note_results"                # Where to save generated notes
-  format:
-    - "toc"                            # Generate table of contents
-    - "link"                           # Add timestamp markers (*Content-[mm:ss])
-    - "screenshot"                     # Add screenshot placeholders (*Screenshot-[mm:ss])
-    - "summary"                        # Append AI summary
-  style: "detailed"                    # Note style (see style guide)
+  directory_flag: -o/--output
+  transcript_json: '*_transcript.json'
+  chunk_summaries: '*_chunk_summaries.md'
+  final_notes: '*_final_notes.md'
+  visual_manifest: '*_visual_manifest.json'
 
-# --- Chunking Settings ---
-# For long videos, the transcript is split into chunks for processing.
-chunking:
-  enabled: true
-  max_segment_chars: 3000              # Max characters per chunk sent to LLM
-  merge_strategy: "sequential"         # sequential (preserves order)
+frames:
+  enabled_flag: --frames
+  frame_interval_flag: --frame-interval
+  max_frames_flag: --max-frames
+  max_agent_frames_env: VIDEO_NOTES_MAX_AGENT_FRAMES
+  frame_max_width_env: VIDEO_NOTES_FRAME_MAX_WIDTH
+
+agent_workflow:
+  - Read '*_final_notes.md' first.
+  - Read '*_chunk_summaries.md' before opening transcript JSON.
+  - When frames are extracted, read '*_visual_manifest.json'.
+  - Open at most one frame per model request and write visual observations back into the Markdown if needed.

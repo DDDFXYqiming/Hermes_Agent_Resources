@@ -34,15 +34,15 @@ Trigger when the user says any of:
 ```bash
 # Summarize a Bilibili video
 python ~/.hermes/skills/media/video-notes-generator/scripts/video_to_notes.py \
-  --url "https://www.bilibili.com/video/BV1xxxxx"
+  "https://www.bilibili.com/video/BV1xxxxx"
 
-# Summarize a YouTube video with detailed style
+# Summarize a YouTube video and write outputs to a custom directory
 python ~/.hermes/skills/media/video-notes-generator/scripts/video_to_notes.py \
-  --url "https://www.youtube.com/watch?v=xxxxx" --style detailed
+  "https://www.youtube.com/watch?v=xxxxx" -o ./my_notes
 
-# Process a local file with screenshots and AI summary
+# Process a local file with extracted frames for native multimodal analysis
 python ~/.hermes/skills/media/video-notes-generator/scripts/video_to_notes.py \
-  --file /path/to/video.mp4 --format link,screenshot,summary
+  "/path/to/video.mp4" --frames --frame-interval 30 --max-frames 3
 ```
 
 ## Configuration
@@ -51,49 +51,37 @@ python ~/.hermes/skills/media/video-notes-generator/scripts/video_to_notes.py \
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `OPENAI_API_KEY` | Yes | — | API key for LLM (OpenAI-compatible) |
-| `OPENAI_BASE_URL` | No | `https://api.openai.com/v1` | LLM API base URL |
-| `TRANSCRIBER_TYPE` | No | `fast-whisper` | Engine: `fast-whisper`, `groq`, `bcut`, `kuaishou`, `mlx-whisper` |
-| `WHISPER_MODEL_SIZE` | No | `base` | Whisper model: `tiny`, `base`, `small`, `medium`, `large-v3` |
-| `GROQ_API_KEY` | No | — | Required if using groq transcriber |
-| `GROQ_TRANSCRIBER_MODEL` | No | `whisper-large-v3-turbo` | Groq whisper model |
-| `NOTE_OUTPUT_DIR` | No | `./note_results` | Output directory for generated notes |
+| `VIDEO_NOTES_RUNTIME_DIR` | No | `E:\AI_Projects\video-notes-generator-runtime` | Runtime directory for optional `.env`, bins, and downloaded helper assets |
+| `VIDEO_NOTES_ENV` | No | `<VIDEO_NOTES_RUNTIME_DIR>/.env` | Optional env file loaded before running |
+| `YTDLP` | No | auto-detected `yt-dlp` | Path to yt-dlp executable |
+| `FFMPEG` | No | auto-detected `ffmpeg` | Path to ffmpeg executable |
+| `TRANSCRIBER_TYPE` | No | `faster-whisper` | Engine selection used by the script when subtitles are unavailable |
+| `WHISPER_CPP` | No | auto-detected | Optional whisper.cpp binary path |
+| `WHISPER_MODEL` | No | `base` | whisper.cpp model name when using `--transcribe` / whisper.cpp |
+| `VIDEO_NOTES_TRANSCRIPT_CHUNK_CHARS` | No | `3200` | Character budget per compact transcript chunk |
+| `VIDEO_NOTES_TRANSCRIPT_PREVIEW_CHARS` | No | `1200` | Transcript preview length in final notes |
+| `VIDEO_NOTES_MAX_AGENT_FRAMES` | No | `3` | Default maximum extracted frames for agent-safe multimodal analysis |
+| `VIDEO_NOTES_FRAME_MAX_WIDTH` | No | `640` | Maximum frame image width after resizing |
 
 ### CLI Arguments
 
 | Arg | Description |
 |---|---|
-| `--url` | Video URL (Bilibili, YouTube, Douyin, Kuaishou) |
-| `--file` | Path to local video file |
-| `--style` | Note style (see below) |
-| `--format` | Comma-separated: `toc`, `link`, `screenshot`, `summary` |
-| `--quality` | Download quality: `fast`, `normal`, `high` |
-| `--frames` | Extract video frames and emit a visual manifest for native multimodal image analysis |
+| `url` | Required positional argument: video URL (Bilibili, YouTube, Douyin, Kuaishou) or local video file path |
+| `-o`, `--output` | Output directory; default `./notes` |
+| `--no-subtitle` | Skip subtitle fetching and download/transcribe audio directly |
+| `--transcribe` | Force whisper.cpp transcription instead of subtitle-first behavior |
+| `--model` | whisper.cpp model name; defaults to `WHISPER_MODEL` or `base` |
+| `--frames` | Extract video frames and emit `*_visual_manifest.json` for native multimodal image analysis |
 | `--frame-interval` | Seconds between extracted frames; default `30` |
-| `--max-frames` | Maximum extracted frames; default `8` |
+| `--max-frames` | Maximum extracted frames; default `VIDEO_NOTES_MAX_AGENT_FRAMES` (`3` unless overridden) |
+| `--print-full-json` | Print full structured JSON to stdout; avoid in Claude Code unless raw JSON is explicitly requested |
 
-## Style Reference
+Unsupported in this script version: `--url`, `--file`, `--style`, `--format`, and `--quality`. Use the positional `url` argument and let the agent synthesize the final note style from `*_final_notes.md`, `*_chunk_summaries.md`, and optional frames.
 
-| Value | Label | Description |
-|---|---|---|
-| `minimal` | 精简 | Concise, key points only |
-| `detailed` | 详细 | Comprehensive with full discussion |
-| `academic` | 学术 | Formal, structured for academic use |
-| `tutorial` | 教程 | Step-by-step with key conclusions |
-| `xiaohongshu` | 小红书 | Social media style with emojis and hooks |
-| `life_journal` | 生活向 | Personal, emotional expression |
-| `task_oriented` | 任务导向 | Goals, tasks, action items |
-| `business` | 商业风格 | Formal business report style |
-| `meeting_minutes` | 会议纪要 | Meeting minutes format |
+## Note Style
 
-## Format Options
-
-| Value | Description |
-|---|---|
-| `toc` | Auto-generate table of contents from `##` headings |
-| `link` | Add `*Content-[mm:ss]` timestamp markers to headings |
-| `screenshot` | Extract real image frames when `--frames` is used; otherwise insert `*Screenshot-[mm:ss]` markers |
-| `summary` | Append an AI-generated summary at the end |
+This script does not accept a `--style` flag. It produces compact source artifacts (`*_final_notes.md`, `*_chunk_summaries.md`, `*_transcript.json`, and optionally `*_visual_manifest.json`). The agent should transform those artifacts into the user-requested style in the conversation or by editing the generated Markdown.
 
 ## Platform Support
 
@@ -134,27 +122,26 @@ The CLI prints a short JSON summary by default. Do not use `--print-full-json` i
 
 ## Common Pitfalls
 
-1. **Missing OPENAI_API_KEY**: Set it in `.env` or `export` before running. The LLM call will fail without it.
-2. **No ffmpeg**: Required system dependency. Install via `apt install ffmpeg` / `brew install ffmpeg` / `choco install ffmpeg`.
-3. **Bilibili download fails**: Set Bilibili cookies in config for restricted videos.
-4. **YouTube subtitle missing**: Falls back to Whisper transcription — may be slow for long videos.
-5. **GPU not detected**: Whisper defaults to CUDA. Set device to `cpu` if no GPU available.
+1. **No ffmpeg**: Required system dependency. Install via `apt install ffmpeg` / `brew install ffmpeg` / `choco install ffmpeg`.
+2. **No yt-dlp**: Required for URL downloads. Install yt-dlp and optionally set `YTDLP` if it is not on PATH.
+3. **Bilibili download fails**: Set Bilibili cookies for restricted videos or videos that require login.
+4. **YouTube subtitle missing**: Falls back to audio transcription, which may be slow for long videos.
+5. **Frames missing**: Frames are extracted only when `--frames` is passed.
 6. **Long video (>2h)**: Automatically chunked and merged, but may take significant time.
-7. **Chinese output only**: The prompt is designed for Chinese notes. English output requires prompt customization.
-8. **Style not applied**: Ensure `--style` value matches exactly (e.g., `xiaohongshu`, not `xhs`).
+7. **Chinese output only**: The generated artifacts are Chinese-oriented; transform the final response manually if the user asks for another language/style.
+8. **Old parameters fail**: This script version does not support `--url`, `--file`, `--style`, `--format`, or `--quality`; pass the URL/local file as the positional `url` argument.
 
 ## Verification Checklist
 
 After running, verify:
-- [ ] Output `.md` integrated notes file exists in `NOTE_OUTPUT_DIR`
+- [ ] Output `.md` integrated notes file exists in the selected output directory
 - [ ] Output `.json` transcript file exists for programmatic reuse
 - [ ] Output `*_chunk_summaries.md` exists and is read before full transcript JSON
 - [ ] Output `*_final_notes.md` exists for user-facing notes
 - [ ] Markdown renders correctly (no broken formatting)
-- [ ] Timestamps (`*Content-[mm:ss]`) are present if `link` format was selected
-- [ ] Frames directory contains images if `--frames` / `screenshot` format was selected
+- [ ] Frame timestamp sections are present when `--frames` is used
+- [ ] Frames directory contains images if `--frames` is used
 - [ ] `*_visual_manifest.json` points to existing image files when frames were extracted
 - [ ] No more than one frame is passed into any single model request unless the user explicitly asks for deeper visual inspection
 - [ ] Native multimodal visual notes are used when image input is supported; OCR fallback is marked if used
-- [ ] AI summary section exists if `summary` format was selected
 - [ ] No error messages in terminal output
