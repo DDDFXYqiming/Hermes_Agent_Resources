@@ -722,8 +722,9 @@ def build_notes_markdown(output: TranscribeOutput, safe_id: str) -> str:
             lines.extend([
                 f"### {ts}",
                 "",
-                f"- Frame path: `{rel_path}`" if image_path else "",
-                "- Do not batch-open frames. Inspect at most one image per model request.",
+                f"![视频截图 {ts}]({rel_path})" if image_path else "",
+                "",
+                f"*Frame path: `{rel_path}`*" if image_path else "",
                 "",
             ])
             if visual_note:
