@@ -61,6 +61,15 @@ class VideoInfo:
     chapters: List[dict] = field(default_factory=list)
 
 @dataclass
+class FrameInfo:
+    index: int
+    timestamp: float
+    timestamp_text: str
+    image_path: str
+    nearby_transcript: str = ""
+    visual_note: str = ""
+
+@dataclass
 class TranscribeOutput:
     video_info: dict = field(default_factory=dict)
     transcript_text: str = ""
@@ -68,17 +77,70 @@ class TranscribeOutput:
     chapters: List[dict] = field(default_factory=list)
     source: str = ""
     output_file: str = ""
+    visual_frames: List[dict] = field(default_factory=list)
+    visual_manifest_file: str = ""
     notes_md: str = ""  # 由 Agent 填充的 Markdown 笔记
 
 # ============================================================
 # 工具函数
 # ============================================================
 
-YTDLP = shutil.which("yt-dlp") or os.path.expanduser("~/.local/bin/yt-dlp")
-FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
+RUNTIME_DIR = os.getenv("VIDEO_NOTES_RUNTIME_DIR", r"E:\AI_Projects\video-notes-generator-runtime")
 
+
+def load_runtime_env():
+    env_file = os.getenv("VIDEO_NOTES_ENV", os.path.join(RUNTIME_DIR, ".env"))
+    if not os.path.isfile(env_file):
+        return
+    with open(env_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip())
+
+
+load_runtime_env()
+
+YTDLP = os.getenv("YTDLP") or shutil.which("yt-dlp") or os.path.expanduser("~/.local/bin/yt-dlp")
+FFMPEG = os.getenv("FFMPEG") or shutil.which("ffmpeg") or "ffmpeg"
 WHISPER_CPP_PATH = os.getenv("WHISPER_CPP", "")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base").lower()
+TRANSCRIBER_TYPE = os.getenv("TRANSCRIBER_TYPE", "faster-whisper").lower()
+
+
+def runtime_path(*parts):
+    return os.path.join(RUNTIME_DIR, *parts)
+
+
+def run_command(cmd, timeout=60, env=None, cwd=None, check=False):
+    command_env_vars = dict(os.environ)
+    if env:
+        command_env_vars.update(env)
+    command_env_vars.setdefault("PYTHONIOENCODING", "utf-8")
+    command_env_vars.setdefault("PYTHONUTF8", "1")
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=command_env_vars,
+        cwd=cwd,
+        check=check,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def command_env():
+    path_entries = [
+        os.path.expanduser("~/.local/bin"),
+        runtime_path("bin"),
+        os.path.dirname(FFMPEG) if os.path.isabs(FFMPEG) else "",
+        os.environ.get("PATH", ""),
+    ]
+    return {"PATH": os.pathsep.join(p for p in path_entries if p)}
 
 def check_deps():
     """检查必要工具"""
@@ -90,7 +152,7 @@ def check_deps():
             f"https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp "
             f"&& chmod +x ~/.local/bin/yt-dlp"
         )
-    if not shutil.which(FFMPEG):
+    if not (shutil.which(FFMPEG) or os.path.isfile(FFMPEG)):
         issues.append(
             f"ffmpeg 未安装: apt install ffmpeg (或 brew install ffmpeg)"
         )
@@ -279,6 +341,35 @@ def transcribe_via_whisper_cpp(audio_path: str, model: str = "base") -> Optional
         print(f"[transcribe] whisper.cpp 转写失败: {e}", file=sys.stderr)
         return None
 
+
+def transcribe_via_faster_whisper(audio_path: str, model: str = "base") -> Optional[List[TranscriptSegment]]:
+    try:
+        os.environ.setdefault("HF_HOME", runtime_path("hf-cache"))
+        os.environ.setdefault("HUGGINGFACE_HUB_CACHE", runtime_path("hf-cache", "hub"))
+        os.environ.setdefault("XDG_CACHE_HOME", runtime_path("cache"))
+        from faster_whisper import WhisperModel
+    except Exception as e:
+        print(f"[transcribe] faster-whisper 不可用: {e}", file=sys.stderr)
+        return None
+
+    try:
+        os.makedirs(runtime_path("models"), exist_ok=True)
+        print(f"[transcribe] faster-whisper 转写中 (model={model})...", file=sys.stderr)
+        whisper_model = WhisperModel(
+            model,
+            device=os.getenv("WHISPER_DEVICE", "cpu"),
+            compute_type=os.getenv("WHISPER_COMPUTE_TYPE", "int8"),
+            download_root=runtime_path("models"),
+        )
+        raw_segments, _ = whisper_model.transcribe(audio_path, language="zh", vad_filter=True)
+        segments = [TranscriptSegment(start=s.start, end=s.end, text=s.text.strip()) for s in raw_segments if s.text.strip()]
+        if segments:
+            print(f"[transcribe] faster-whisper 转写完成: {len(segments)} 段", file=sys.stderr)
+        return segments if segments else None
+    except Exception as e:
+        print(f"[transcribe] faster-whisper 转写失败: {e}", file=sys.stderr)
+        return None
+
 # ============================================================
 # SRT 字幕解析器 (纯标准库)
 # ============================================================
@@ -318,6 +409,24 @@ def parse_duration(seconds) -> float:
         elif len(parts) == 2:
             return parts[0] * 60 + parts[1]
     return 0.0
+
+
+def format_timestamp(seconds: float) -> str:
+    seconds = max(0, float(seconds or 0))
+    total = int(seconds)
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def find_nearby_transcript(segments: List[dict], timestamp: float, window: float = 8.0) -> str:
+    nearby = []
+    for segment in segments:
+        start = float(segment.get("start", 0) or 0)
+        end = float(segment.get("end", start) or start)
+        if start - window <= timestamp <= end + window:
+            text = str(segment.get("text", "")).strip()
+            if text:
+                nearby.append(text)
+    return " ".join(nearby)[:500]
 
 # ============================================================
 # 视频信息 + 字幕获取
@@ -402,17 +511,195 @@ def download_audio(url: str, output_dir: str, platform: str) -> Optional[AudioMe
                             platform=platform, file_path=os.path.join(output_dir, f))
     return None
 
+
+def download_video_for_frames(url: str, output_dir: str, platform: str) -> Optional[str]:
+    if platform == "local" and os.path.isfile(url):
+        return url
+
+    frame_source_dir = os.path.join(output_dir, "visual_source_h264")
+    os.makedirs(frame_source_dir, exist_ok=True)
+    output_template = os.path.join(frame_source_dir, "%(id)s.%(ext)s")
+    cmd = [
+        YTDLP,
+        "-f", "bestvideo[vcodec^=avc1][height<=720]+bestaudio/bestvideo[vcodec!=av01][height<=720]+bestaudio/best[height<=720]/best",
+        "-o", output_template,
+        "--no-playlist",
+        "--merge-output-format", "mp4",
+    ]
+    print("[vision] 正在下载视频用于抽帧...", file=sys.stderr)
+    result = run_command(cmd + [url], timeout=900, env=command_env())
+    if result.returncode != 0:
+        print(f"[vision] 视频下载失败，无法抽帧: {result.stderr[:200]}", file=sys.stderr)
+        return None
+
+    video_exts = (".mp4", ".mkv", ".webm", ".mov", ".flv", ".avi", ".m4v")
+    candidates = [
+        os.path.join(frame_source_dir, name)
+        for name in os.listdir(frame_source_dir)
+        if name.lower().endswith(video_exts)
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
+
+
+def extract_visual_frames(video_path: str, output_dir: str, safe_id: str, duration: float,
+                          segments: List[dict], frame_interval: float = 30.0,
+                          max_frames: int = 8) -> List[FrameInfo]:
+    if not video_path or not os.path.exists(video_path):
+        return []
+
+    frames_dir = os.path.join(output_dir, f"{safe_id}_frames")
+    os.makedirs(frames_dir, exist_ok=True)
+
+    duration = float(duration or 0)
+    frame_interval = max(1.0, float(frame_interval or 30.0))
+    max_frames = max(1, int(max_frames or 8))
+
+    if duration > 0:
+        timestamps = []
+        current = min(3.0, max(0.0, duration / 3))
+        while current < duration and len(timestamps) < max_frames:
+            timestamps.append(current)
+            current += frame_interval
+        if not timestamps:
+            timestamps = [0.0]
+    else:
+        timestamps = [i * frame_interval for i in range(max_frames)]
+
+    frames = []
+    for index, timestamp in enumerate(timestamps, start=1):
+        image_path = os.path.join(frames_dir, f"frame_{index:03d}_{int(timestamp):06d}s.jpg")
+        cmd = [
+            FFMPEG, "-y",
+            "-ss", f"{timestamp:.3f}",
+            "-i", video_path,
+            "-frames:v", "1",
+            "-q:v", "3",
+            image_path,
+        ]
+        result = run_command(cmd, timeout=120, env=command_env())
+        if result.returncode != 0 or not os.path.exists(image_path):
+            print(f"[vision] 抽帧失败 {format_timestamp(timestamp)}: {result.stderr[:160]}", file=sys.stderr)
+            continue
+        frames.append(FrameInfo(
+            index=index,
+            timestamp=timestamp,
+            timestamp_text=format_timestamp(timestamp),
+            image_path=os.path.abspath(image_path),
+            nearby_transcript=find_nearby_transcript(segments, timestamp),
+            visual_note="",
+        ))
+
+    if frames:
+        print(f"[vision] 已抽取视觉帧: {len(frames)} 张", file=sys.stderr)
+    return frames
+
+
+def build_notes_markdown(output: TranscribeOutput, safe_id: str) -> str:
+    info = output.video_info or {}
+    title = info.get("title") or safe_id
+    uploader = info.get("uploader") or ""
+    duration = format_timestamp(float(info.get("duration") or 0))
+    tags = info.get("tags") or []
+    source = output.source or "unknown"
+
+    lines = [
+        f"# {title}",
+        "",
+        "## 基本信息",
+        "",
+        f"- 来源：{source}",
+        f"- UP 主/作者：{uploader}" if uploader else "- UP 主/作者：未知",
+        f"- 时长：{duration}",
+    ]
+    if tags:
+        lines.append(f"- 标签：{', '.join(str(tag) for tag in tags)}")
+    if output.visual_frames:
+        lines.append(f"- 视觉帧：{len(output.visual_frames)} 张")
+    lines.extend(["", "## 一句话总结", ""])
+
+    if output.transcript_text:
+        first_text = " ".join(output.transcript_text.split())[:180]
+        lines.append(first_text + ("……" if len(output.transcript_text) > 180 else ""))
+    else:
+        lines.append("该视频暂无可用转写文本，请结合视觉帧和元信息继续分析。")
+
+    lines.extend(["", "## 时间线与视觉证据", ""])
+    if output.visual_frames:
+        for frame in output.visual_frames:
+            ts = frame.get("timestamp_text", "00:00")
+            image_path = frame.get("image_path", "")
+            nearby = frame.get("nearby_transcript", "").strip()
+            visual_note = frame.get("visual_note", "").strip()
+            rel_path = image_path
+            try:
+                rel_path = os.path.relpath(image_path, os.path.dirname(output.output_file))
+            except Exception:
+                pass
+            rel_path = rel_path.replace(os.sep, "/")
+            lines.extend([
+                f"### {ts}",
+                "",
+                f"![{ts}]({rel_path})" if image_path else "",
+                "",
+            ])
+            if visual_note:
+                lines.extend([f"**视觉观察**：{visual_note}", ""])
+            else:
+                lines.extend(["**视觉观察**：待多模态模型读取该帧后补充；若模型不支持图片输入，可使用 OCR fallback 并标注来源。", ""])
+            if nearby:
+                lines.extend([f"**附近转写**：{nearby}", ""])
+    elif output.segments:
+        for segment in output.segments[:12]:
+            ts = format_timestamp(float(segment.get("start", 0) or 0))
+            text = str(segment.get("text", "")).strip()
+            if text:
+                lines.append(f"- `{ts}` {text}")
+        lines.append("")
+    else:
+        lines.append("暂无时间线数据。")
+        lines.append("")
+
+    lines.extend(["## 结构化摘要", ""])
+    if output.segments:
+        chunk_size = max(1, len(output.segments) // 5)
+        for i in range(0, len(output.segments), chunk_size):
+            chunk = output.segments[i:i + chunk_size]
+            start = format_timestamp(float(chunk[0].get("start", 0) or 0))
+            text = " ".join(str(s.get("text", "")).strip() for s in chunk if str(s.get("text", "")).strip())[:260]
+            if text:
+                lines.append(f"- `{start}` {text}")
+    else:
+        lines.append("- 暂无字幕/转写内容。")
+
+    lines.extend(["", "## 完整转写", ""])
+    if output.transcript_text:
+        lines.append(output.transcript_text.strip())
+    else:
+        lines.append("暂无完整转写。")
+
+    if output.visual_manifest_file:
+        lines.extend(["", "## 关联文件", "", f"- 视觉清单：`{output.visual_manifest_file}`"])
+    if output.output_file:
+        lines.append(f"- 结构化数据：`{output.output_file}`")
+
+    return "\n".join(line for line in lines if line is not None).rstrip() + "\n"
+
 # ============================================================
 # 主流程
 # ============================================================
 
 def generate_transcript(url: str, output_dir: str = "./notes",
-                        prefer_subtitle: bool = True, force_transcribe: bool = False) -> TranscribeOutput:
+                        prefer_subtitle: bool = True, force_transcribe: bool = False,
+                        extract_frames: bool = False, frame_interval: float = 30.0,
+                        max_frames: int = 8) -> TranscribeOutput:
     """
     视频→转写 主流程
     - 自动检测平台
     - 优先获取字幕
-    - 字幕不可用时下载音频 + whisper.cpp 转写
+    - 字幕不可用时下载音频 + whisper.cpp/faster-whisper 转写
+    - 可选下载视频并用 ffmpeg 抽帧，输出供多模态模型原生读图的视觉清单
     - 输出结构化 JSON 供 Agent 生成笔记
     """
     issues = check_deps()
@@ -487,27 +774,58 @@ def generate_transcript(url: str, output_dir: str = "./notes",
         if audio_meta:
             print(f"[info] 音频下载完成: {os.path.basename(audio_meta.file_path)} ({audio_meta.duration:.0f}s)", file=sys.stderr)
 
-            if force_transcribe or get_whisper_cpp() or os.getenv("WHISPER_CPP"):
-                whisper_segments = transcribe_via_whisper_cpp(audio_meta.file_path, WHISPER_MODEL)
+            if force_transcribe or TRANSCRIBER_TYPE == "faster-whisper" or get_whisper_cpp() or os.getenv("WHISPER_CPP"):
+                if TRANSCRIBER_TYPE == "faster-whisper" and not os.getenv("WHISPER_CPP"):
+                    whisper_segments = transcribe_via_faster_whisper(audio_meta.file_path, WHISPER_MODEL)
+                else:
+                    whisper_segments = transcribe_via_whisper_cpp(audio_meta.file_path, WHISPER_MODEL)
                 if whisper_segments:
                     output.transcript_text = "\n".join(s.text for s in whisper_segments)
                     output.segments = [asdict(s) for s in whisper_segments]
-                    output.source = "audio_transcription"
+                    output.source = TRANSCRIBER_TYPE if TRANSCRIBER_TYPE == "faster-whisper" else "whisper.cpp"
                 else:
                     output.source = "audio_only"
-                    output.source_note = f"需 whisper.cpp 转写，音频: {audio_meta.file_path}"
+                    output.source_note = f"音频已保存到: {audio_meta.file_path}，转写器未产出文本。"
             else:
                 output.source = "audio_only"
-                output.source_note = f"音频已保存至: {audio_meta.file_path}。安装 whisper.cpp 可自动转写。"
+                output.source_note = f"音频已保存到: {audio_meta.file_path}，配置转写器后可自动转写。"
         else:
             output.source = "failed"
 
     # 保存 JSON
     safe_id = re.sub(r'[^\w-]', '', video_id)[:50]
+
+    if extract_frames:
+        video_path = download_video_for_frames(url, output_dir, platform)
+        frames = extract_visual_frames(
+            video_path=video_path,
+            output_dir=output_dir,
+            safe_id=safe_id,
+            duration=video_info_obj.duration,
+            segments=output.segments,
+            frame_interval=frame_interval,
+            max_frames=max_frames,
+        )
+        output.visual_frames = [asdict(frame) for frame in frames]
+        if output.visual_frames:
+            output.visual_manifest_file = os.path.join(output_dir, f"{safe_id}_visual_manifest.json")
+            with open(output.visual_manifest_file, "w", encoding="utf-8") as f:
+                json.dump({
+                    "video_info": output.video_info,
+                    "frames": output.visual_frames,
+                    "instruction": "Use native multimodal image understanding to inspect these frames. Do not OCR or transcribe on-screen text as the primary method.",
+                }, f, ensure_ascii=False, indent=2)
+
     output_file = os.path.join(output_dir, f"{safe_id}_transcript.json")
 
     output.output_file = output_file
+    output.notes_md = build_notes_markdown(output, safe_id)
+    notes_file = os.path.join(output_dir, f"{safe_id}_notes.md")
+    with open(notes_file, "w", encoding="utf-8") as f:
+        f.write(output.notes_md)
+
     output_data = asdict(output)
+    output_data["notes_file"] = notes_file
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(output_data, f, ensure_ascii=False, indent=2)
 
@@ -522,6 +840,7 @@ def generate_transcript(url: str, output_dir: str = "./notes",
     if output.segments:
         print(f"  段落数: {len(output.segments)}", file=sys.stderr)
     print(f"  输出: {output_file}", file=sys.stderr)
+    print(f"  笔记: {notes_file}", file=sys.stderr)
     print(f"{'='*60}", file=sys.stderr)
     return output
 
@@ -546,6 +865,9 @@ def main():
     parser.add_argument("--no-subtitle", action="store_true", help="跳过字幕获取，直接下载音频")
     parser.add_argument("--transcribe", action="store_true", help="强制使用 whisper.cpp 转写")
     parser.add_argument("--model", default=None, help="whisper.cpp 模型 (默认读取 WHISPER_MODEL 环境变量或 base)")
+    parser.add_argument("--frames", action="store_true", help="抽取视频画面帧并输出视觉清单，供多模态模型原生读图")
+    parser.add_argument("--frame-interval", type=float, default=30.0, help="抽帧间隔秒数，默认 30")
+    parser.add_argument("--max-frames", type=int, default=8, help="最多抽取帧数，默认 8")
     args = parser.parse_args()
 
     global WHISPER_MODEL
@@ -558,6 +880,9 @@ def main():
             output_dir=args.output,
             prefer_subtitle=not args.no_subtitle,
             force_transcribe=args.transcribe,
+            extract_frames=args.frames,
+            frame_interval=args.frame_interval,
+            max_frames=args.max_frames,
         )
         print(json.dumps(asdict(output), ensure_ascii=False, indent=2))
         return 0

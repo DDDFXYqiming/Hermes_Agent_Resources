@@ -1,6 +1,6 @@
 ---
 name: video-notes-generator
-description: "Use when user wants to summarize, analyze, or generate notes from a video URL. Converts video content into structured Markdown notes with timestamps, screenshots, and AI summaries. Supports Bilibili, YouTube, Douyin, Kuaishou, and local files."
+description: "Use when user wants to summarize, analyze, or generate notes from a video URL. Converts video content into structured Markdown notes with timestamps, extracted visual frames, native multimodal image observations, and AI summaries. Supports Bilibili, YouTube, Douyin, Kuaishou, and local files."
 version: 1.0.0
 author: Diana (extracted from BiliNote v2.2.1 by JefferyHcool)
 license: MIT
@@ -16,7 +16,7 @@ metadata:
 > Based on [BiliNote v2.2.1](https://github.com/JefferyHcool/BiliNote) by JefferyHcool.
 > No external LLM / API Key required. The Agent itself acts as the LLM for note generation.
 
-Converts video content from URLs or local files into structured, readable Markdown notes using AI. Supports multiple video platforms, transcription engines, and note styles.
+Converts video content from URLs or local files into structured, readable Markdown notes using AI. Supports multiple video platforms, transcription engines, note styles, and optional visual frame extraction for native multimodal image understanding.
 
 Extracted from **BiliNote v2.2.1** by JefferyHcool.
 
@@ -68,6 +68,9 @@ python ~/.hermes/skills/media/video-notes-generator/scripts/video_to_notes.py \
 | `--style` | Note style (see below) |
 | `--format` | Comma-separated: `toc`, `link`, `screenshot`, `summary` |
 | `--quality` | Download quality: `fast`, `normal`, `high` |
+| `--frames` | Extract video frames and emit a visual manifest for native multimodal image analysis |
+| `--frame-interval` | Seconds between extracted frames; default `30` |
+| `--max-frames` | Maximum extracted frames; default `8` |
 
 ## Style Reference
 
@@ -89,7 +92,7 @@ python ~/.hermes/skills/media/video-notes-generator/scripts/video_to_notes.py \
 |---|---|
 | `toc` | Auto-generate table of contents from `##` headings |
 | `link` | Add `*Content-[mm:ss]` timestamp markers to headings |
-| `screenshot` | Insert `*Screenshot-[mm:ss]` placeholders for visual sections |
+| `screenshot` | Extract real image frames when `--frames` is used; otherwise insert `*Screenshot-[mm:ss]` markers |
 | `summary` | Append an AI-generated summary at the end |
 
 ## Platform Support
@@ -101,6 +104,18 @@ python ~/.hermes/skills/media/video-notes-generator/scripts/video_to_notes.py \
 | Douyin | ❌ | yt-dlp + ABogus | Not needed | Anti-bot bypass built-in |
 | Kuaishou | ✅ | yt-dlp + helper | Not needed | Custom downloader |
 | Local | N/A | Direct file | N/A | Any format FFmpeg supports |
+
+## Native Multimodal Visual Workflow
+
+When the user asks for image-aware video analysis and the active model supports images:
+
+1. Run the script with `--frames`, plus `--frame-interval` / `--max-frames` as needed.
+2. If the active model supports native image input, open each `image_path` directly and analyze the actual frame visually.
+3. Fill the summary with visual observations such as scene changes, UI operations, gestures, objects, diagrams, and slide structure.
+4. If the active model does **not** support image input, use OCR only as a fallback and clearly mark those notes as OCR-derived rather than native visual understanding.
+5. Combine visual observations with `nearby_transcript` and timestamps; do not invent details that are not visible or audible.
+
+The script writes `*_notes.md` as the integrated user-facing note. It keeps `visual_note` blank in JSON on purpose; the agent/model should inspect the actual image files when native multimodal input is available, or use OCR fallback only when image input is unavailable.
 
 ## Common Pitfalls
 
@@ -116,9 +131,12 @@ python ~/.hermes/skills/media/video-notes-generator/scripts/video_to_notes.py \
 ## Verification Checklist
 
 After running, verify:
-- [ ] Output `.md` file exists in `NOTE_OUTPUT_DIR`
+- [ ] Output `.md` integrated notes file exists in `NOTE_OUTPUT_DIR`
+- [ ] Output `.json` transcript file exists for programmatic reuse
 - [ ] Markdown renders correctly (no broken formatting)
 - [ ] Timestamps (`*Content-[mm:ss]`) are present if `link` format was selected
-- [ ] Screenshots directory contains images if `screenshot` format was selected
+- [ ] Frames directory contains images if `--frames` / `screenshot` format was selected
+- [ ] `*_visual_manifest.json` points to existing image files when frames were extracted
+- [ ] Native multimodal visual notes are used when image input is supported; OCR fallback is marked if used
 - [ ] AI summary section exists if `summary` format was selected
 - [ ] No error messages in terminal output
