@@ -10,6 +10,7 @@ For every verified video, produce and verify:
 - `*_visual_manifest.json` listing frame paths, timestamps, nearby transcript, and `visual_note` fields.
 - `*_visual_analysis.json` or equivalent persisted model output with overall visual summary and per-frame notes.
 - Updated `*_final_notes.md` containing:
+  - A horizontal Mermaid mind map (`flowchart LR`) at the very beginning of the document.
   - Markdown image embeds for the selected frames.
   - A visual evidence section that combines what is visible in the frame with nearby transcript context.
   - Clear fallback labels if OCR/text-only analysis was used instead of native multimodal vision.
@@ -26,12 +27,13 @@ For every verified video, produce and verify:
    - `frames`: per-frame notes keyed by frame index.
 6. Write the parsed visual notes back into the manifest and persist raw/parsed model output in `*_visual_analysis.json` for auditability.
 7. Retry only failed visual analyses rather than rerunning the entire batch. Treat timeouts/connection drops as transient and safe to retry.
-8. Merge image embeds and visual notes into each final markdown file, then regenerate the channel/uploader summary from the updated final notes. Make the merge idempotent: wrap the inserted visual section in stable HTML comments such as `<!-- VISUAL_ENRICHMENT_START -->` / `<!-- VISUAL_ENRICHMENT_END -->`, strip any previous block before reinserting, and place the section before the existing timeline/summary section so screenshots are visible early in the note.
+8. Merge the opening Mermaid mind map, image embeds, and visual notes into each final markdown file, then regenerate the channel/uploader summary from the updated final notes. Make the merge idempotent: wrap the inserted visual section in stable HTML comments such as `<!-- VISUAL_ENRICHMENT_START -->` / `<!-- VISUAL_ENRICHMENT_END -->`, strip any previous block before reinserting, and place the section before the existing timeline/summary section so screenshots are visible early in the note.
 9. Verify counts before reporting success: verified videos, visual manifests, frame files, visual analyses, final notes with image embeds, and regenerated aggregate files must all match. For a three-frame-per-video pass, assert at least `video_count * 3` Markdown image embeds and `video_count * 3` per-frame visual observations in the regenerated aggregate summary.
 
 ## Pitfalls
 
 - Do not stop after extracting frames. The user asked for image content to be analyzed; screenshots alone are incomplete.
+- Do not produce a final Markdown that starts directly with prose. The first content after the title must be a `flowchart LR` Mermaid mind map.
 - Do not rely on generic browser screenshots for video content. Use actual downloaded video frames with timestamps.
 - Do not put raw full transcripts and all images in one model request. Use final notes/chunk summaries plus one contact sheet or one frame at a time.
 - Do not hard-code a transient provider failure as a durable limitation. Record the retry/fallback pattern, not the outage.

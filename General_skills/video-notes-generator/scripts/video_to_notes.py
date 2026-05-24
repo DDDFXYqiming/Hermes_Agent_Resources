@@ -7,6 +7,7 @@ Video Notes Generator — 核心脚本 (零pip依赖版本)
 用法:
     python3 video_to_notes.py <video_url> [--output ./notes]
     python3 video_to_notes.py <video_url> --transcribe --model base
+    # Frames, visual manifest, Markdown image embeds, and opening Mermaid mind map are enabled by default.
 """
 
 import argparse
@@ -147,6 +148,31 @@ def command_env():
         os.environ.get("PATH", ""),
     ]
     return {"PATH": os.pathsep.join(p for p in path_entries if p)}
+
+
+def get_ffprobe() -> str:
+    if os.getenv("FFPROBE"):
+        return os.getenv("FFPROBE")
+    if os.path.isabs(FFMPEG):
+        candidate = os.path.join(os.path.dirname(FFMPEG), "ffprobe.exe" if os.name == "nt" else "ffprobe")
+        if os.path.isfile(candidate):
+            return candidate
+    return shutil.which("ffprobe") or "ffprobe"
+
+
+def probe_media_duration(path: str) -> float:
+    if not path or not os.path.exists(path):
+        return 0.0
+    try:
+        result = run_command([
+            get_ffprobe(), "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", path
+        ], timeout=30, env=command_env())
+        if result.returncode == 0:
+            return parse_duration((result.stdout or "").strip())
+    except Exception:
+        pass
+    return 0.0
 
 def check_deps():
     """检查必要工具"""
@@ -512,6 +538,14 @@ def build_chunk_summaries_markdown(output: TranscribeOutput, safe_id: str) -> st
 
 def get_video_info(url: str, platform: str) -> VideoInfo:
     print(f"[info] 获取视频元数据...", file=sys.stderr)
+    if platform == "local" and os.path.isfile(url):
+        return VideoInfo(
+            video_url=os.path.abspath(url),
+            video_id=os.path.basename(url),
+            title=os.path.splitext(os.path.basename(url))[0],
+            platform=platform,
+            duration=probe_media_duration(url),
+        )
     cmd = [YTDLP, "--dump-json", "--no-playlist", "--skip-download"]
     env = {**os.environ, "PATH": f"{os.path.expanduser('~/.local/bin')}:{os.environ.get('PATH', '')}"}
     result = subprocess.run(cmd + [url], capture_output=True, text=True, timeout=60, env=env)
@@ -562,8 +596,16 @@ def get_video_subtitles(url: str, langs: List[str] = None) -> Optional[Transcrip
     return None
 
 def download_audio(url: str, output_dir: str, platform: str) -> Optional[AudioMeta]:
-    """使用 yt-dlp 下载音频"""
+    """使用 yt-dlp 下载音频，或在本地文件模式下直接返回原文件。"""
     os.makedirs(output_dir, exist_ok=True)
+    if platform == "local" and os.path.isfile(url):
+        return AudioMeta(
+            video_id=os.path.splitext(os.path.basename(url))[0],
+            title=os.path.splitext(os.path.basename(url))[0],
+            duration=probe_media_duration(url),
+            platform=platform,
+            file_path=os.path.abspath(url),
+        )
     output_template = os.path.join(output_dir, "%(id)s.%(ext)s")
     cmd = [YTDLP, "-f", "bestaudio[ext=m4a]/bestaudio/best", "-o", output_template,
            "--no-playlist", "--postprocessor-args", "ffmpeg:-b:a 64k"]
@@ -630,18 +672,23 @@ def extract_visual_frames(video_path: str, output_dir: str, safe_id: str, durati
     frames_dir = os.path.join(output_dir, f"{safe_id}_frames")
     os.makedirs(frames_dir, exist_ok=True)
 
-    duration = float(duration or 0)
+    duration = float(duration or 0) or probe_media_duration(video_path)
     frame_interval = max(1.0, float(frame_interval or 30.0))
     max_frames = min(MAX_AGENT_FRAMES, max(1, int(max_frames or 8)))
 
     if duration > 0:
-        timestamps = []
-        current = min(3.0, max(0.0, duration / 3))
-        while current < duration and len(timestamps) < max_frames:
-            timestamps.append(current)
-            current += frame_interval
-        if not timestamps:
-            timestamps = [0.0]
+        # Prefer representative key frames across the whole video. The old interval-only
+        # behavior often produced only the opening seconds when max_frames was small,
+        # which caused agents to forget meaningful visual evidence.
+        if max_frames <= 1:
+            fractions = [0.5]
+        elif max_frames == 2:
+            fractions = [0.25, 0.75]
+        elif max_frames == 3:
+            fractions = [0.20, 0.50, 0.80]
+        else:
+            fractions = [(i + 1) / (max_frames + 1) for i in range(max_frames)]
+        timestamps = [min(max(1.0, duration * frac), max(1.0, duration - 1.0)) for frac in fractions]
     else:
         timestamps = [i * frame_interval for i in range(max_frames)]
 
@@ -653,7 +700,7 @@ def extract_visual_frames(video_path: str, output_dir: str, safe_id: str, durati
             "-ss", f"{timestamp:.3f}",
             "-i", video_path,
             "-frames:v", "1",
-            "-vf", f"scale='min({FRAME_MAX_WIDTH},iw)':-2",
+            "-vf", f"scale=min({FRAME_MAX_WIDTH}\\,iw):-2",
             "-q:v", "7",
             image_path,
         ]
@@ -683,8 +730,18 @@ def build_notes_markdown(output: TranscribeOutput, safe_id: str) -> str:
     tags = info.get("tags") or []
     source = output.source or "unknown"
 
+    safe_title = str(title).replace('"', "'")
     lines = [
         f"# {title}",
+        "",
+        "```mermaid",
+        "flowchart LR",
+        f"  V[\"{safe_title}\"] --> A[\"核心观点\"]",
+        "  V --> B[\"关键证据/案例\"]",
+        "  V --> C[\"方法/步骤\"]",
+        "  V --> D[\"风险与限制\"]",
+        "  V --> E[\"视觉证据/关键帧\"]",
+        "```",
         "",
         "## 基本信息",
         "",
@@ -695,7 +752,7 @@ def build_notes_markdown(output: TranscribeOutput, safe_id: str) -> str:
     if tags:
         lines.append(f"- 标签：{', '.join(str(tag) for tag in tags)}")
     if output.visual_frames:
-        lines.append(f"- 视觉帧：{len(output.visual_frames)} 张（已限制为低上下文预算）")
+        lines.append(f"- 视觉帧：{len(output.visual_frames)} 张（已抽取并嵌入 Markdown；仍需模型逐帧补充真实视觉观察）")
     if output.chunk_summaries_file:
         lines.append(f"- 分块摘要：`{output.chunk_summaries_file}`")
     lines.extend(["", "## 一句话总结", ""])
@@ -730,7 +787,7 @@ def build_notes_markdown(output: TranscribeOutput, safe_id: str) -> str:
             if visual_note:
                 lines.extend([f"**视觉观察**：{visual_note}", ""])
             else:
-                lines.extend(["**视觉观察**：待多模态模型读取该帧后补充；若模型不支持图片输入，可使用 OCR fallback 并标注来源。", ""])
+                lines.extend(["**视觉观察**：pending visual review — 必须由多模态模型读取该帧后补充；若模型不支持图片输入，可使用 OCR fallback 并标注来源。", ""])
             if nearby:
                 lines.extend([f"**附近转写**：{nearby}", ""])
     elif output.segments:
@@ -972,7 +1029,8 @@ def main():
     parser.add_argument("--no-subtitle", action="store_true", help="跳过字幕获取，直接下载音频")
     parser.add_argument("--transcribe", action="store_true", help="强制使用 whisper.cpp 转写")
     parser.add_argument("--model", default=None, help="whisper.cpp 模型 (默认读取 WHISPER_MODEL 环境变量或 base)")
-    parser.add_argument("--frames", action="store_true", help="抽取视频画面帧并输出视觉清单，供多模态模型原生读图")
+    parser.add_argument("--frames", action="store_true", help="兼容旧参数：抽帧现在默认启用")
+    parser.add_argument("--no-frames", action="store_true", help="紧急文本-only模式：跳过抽帧/附图；必须在最终报告中说明原因")
     parser.add_argument("--frame-interval", type=float, default=30.0, help="抽帧间隔秒数，默认 30")
     parser.add_argument("--max-frames", type=int, default=MAX_AGENT_FRAMES, help=f"最多抽取帧数，默认 {MAX_AGENT_FRAMES}")
     parser.add_argument("--print-full-json", action="store_true", help="危险：在 stdout 打印完整 JSON。默认只打印短摘要，避免 Claude Code 上下文溢出")
@@ -988,7 +1046,7 @@ def main():
             output_dir=args.output,
             prefer_subtitle=not args.no_subtitle,
             force_transcribe=args.transcribe,
-            extract_frames=args.frames,
+            extract_frames=not args.no_frames,
             frame_interval=args.frame_interval,
             max_frames=args.max_frames,
         )
@@ -1004,7 +1062,7 @@ def main():
                 "chunk_summaries": output.chunk_summaries_file,
                 "final_notes": output.final_notes_file,
                 "visual_manifest": output.visual_manifest_file,
-                "read_policy": "Read final_notes and chunk_summaries first. Do not read full transcript JSON or batch-open images unless explicitly needed.",
+                "read_policy": "Read final_notes and chunk_summaries first. For video summaries, inspect representative frames one at a time and replace pending visual notes with native multimodal observations when available.",
             }, ensure_ascii=False, indent=2))
         return 0
     except Exception as e:

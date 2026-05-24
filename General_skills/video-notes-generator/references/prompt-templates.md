@@ -10,7 +10,7 @@ The video-notes-generator uses several prompt templates to instruct the LLM. The
 - System role: Professional note assistant
 - Language rules: Chinese output, English for proper nouns/technical terms
 - Injected variables: `{video_title}`, `{tags}`, `{segment_text}`
-- Output rules: Markdown only, no code blocks, escaped numbered headings
+- Output rules: Markdown only; no wrapper code block around the whole response; Mermaid code fences are required/allowed for diagrams; escaped numbered headings
 - Core tasks: Complete info, remove filler, preserve key details, readable layout, preserve LaTeX formulas
 
 **Template** (Chinese):
@@ -29,7 +29,7 @@ The video-notes-generator uses several prompt templates to instruct the LLM. The
 
 输出说明：
 - 仅返回最终的 **Markdown 内容**。
-- **不要**将输出包裹在代码块中。
+- **不要**将整篇输出包裹在代码块中；但必须允许并使用 Mermaid 代码块来绘制图表。
 
 视频分段（格式：开始时间 - 内容）：
 ---
@@ -37,7 +37,7 @@ The video-notes-generator uses several prompt templates to instruct the LLM. The
 ---
 
 你的任务：
-根据上面的分段转录内容，生成结构化的笔记，遵循以下原则：
+根据上面的分段转录内容，生成结构化的笔记。最终 Markdown 开头必须先给出一个 `flowchart LR` 的 Mermaid 横向脑图/思维导图，然后再进入正文。正文中如果存在流程、因果、时间线、层级、对比、交互或数据趋势，积极使用 Mermaid 支持的其他图（flowchart、timeline、sequenceDiagram、quadrantChart、journey、xychart-beta 等）辅助表达。遵循以下原则：
 
 1. **完整信息**：记录尽可能多的相关细节。
 2. **去除无关内容**：省略广告、填充词、问候语。
@@ -125,6 +125,7 @@ a brief conclusion summarizing the whole video.
 - 只做合并与去重，不要发明新内容
 - 保持原有标题层级与 Markdown 结构
 - 保留所有 *Content-[mm:ss] 与 *Screenshot-[mm:ss] 标记
+- 保留并整理开头的 Mermaid 横向脑图；可继续保留/增加有价值的 Mermaid 图表
 - 保持中文输出，专有名词保留英文
 - 不要使用代码块包裹输出
 ```
