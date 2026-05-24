@@ -85,6 +85,8 @@ This script does not accept a `--style` flag. It produces compact source artifac
 
 ## Platform Support
 
+For Bilibili uploader-wide jobs ("summarize all videos from this UP"), see `references/bilibili-uploader-discovery.md` before starting. It documents candidate discovery, per-BV uploader verification with yt-dlp, anti-bot fallbacks, and truthful reporting standards. When the user needs an exact uploader archive rather than candidate discovery, also read `references/bilibili-uploader-exact-space-api.md`; prefer Bilibili-native space/search-index sources plus yt-dlp owner verification over generic web search.
+
 | Platform | Subtitles | Download | Cookies | Notes |
 |---|---|---|---|---|
 | Bilibili | ✅ Priority | yt-dlp | Recommended | Subtitle-first; falls back to whisper |
@@ -105,6 +107,10 @@ When the user asks for image-aware video analysis and the active model supports 
 
 The script writes `*_notes.md` as the integrated user-facing note. It keeps `visual_note` blank in JSON on purpose; the agent/model should inspect the actual image files when native multimodal input is available, or use OCR fallback only when image input is unavailable.
 
+### Bulk uploader visual-enrichment rule
+
+For uploader/channel-wide jobs, a transcript-only first pass is not complete when the user requested or the skill implies screenshots/key frames. Every video must be upgraded with frame image embeds and visual notes, and the aggregate summary must be regenerated from the upgraded per-video Markdown. Use `references/bulk-visual-enrichment.md` for the exact workflow: extract bounded representative frames, analyze them with native multimodal vision or clearly labeled OCR fallback, retry transient vision failures per-video, merge image embeds + visual observations into each `*_final_notes.md`, then verify all counts before reporting success.
+
 ## Context-Safe Workflow
 
 The script is designed to avoid Claude Code context overflow:
@@ -124,7 +130,7 @@ The CLI prints a short JSON summary by default. Do not use `--print-full-json` i
 
 1. **No ffmpeg**: Required system dependency. Install via `apt install ffmpeg` / `brew install ffmpeg` / `choco install ffmpeg`.
 2. **No yt-dlp**: Required for URL downloads. Install yt-dlp and optionally set `YTDLP` if it is not on PATH.
-3. **Bilibili download fails**: Set Bilibili cookies for restricted videos or videos that require login.
+3. **Bilibili download fails**: Set Bilibili cookies for restricted videos or videos that require login. Treat Windows SSL EOF/certificate failures as a fallback path, not the default workflow: retry with the native `yt-dlp.exe --no-check-certificate` in a small custom download/extraction script; avoid relying on a `.cmd` wrapper as `YTDLP` when Python subprocesses also pass Unicode output paths.
 4. **YouTube subtitle missing**: Falls back to audio transcription, which may be slow for long videos.
 5. **Frames missing**: Frames are extracted only when `--frames` is passed.
 6. **Long video (>2h)**: Automatically chunked and merged, but may take significant time.
