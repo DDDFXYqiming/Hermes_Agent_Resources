@@ -55,7 +55,7 @@ python ~/.hermes/skills/media/video-notes-generator/scripts/video_to_notes.py \
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `VIDEO_NOTES_RUNTIME_DIR` | No | `E:\AI_Projects\video-notes-generator-runtime` | Runtime directory for optional `.env`, bins, and downloaded helper assets |
+| `VIDEO_NOTES_RUNTIME_DIR` | No | `~/.cache/video-notes-generator` | Runtime directory for optional `.env`, bins, and downloaded helper assets |
 | `VIDEO_NOTES_ENV` | No | `<VIDEO_NOTES_RUNTIME_DIR>/.env` | Optional env file loaded before running |
 | `YTDLP` | No | auto-detected `yt-dlp` | Path to yt-dlp executable |
 | `FFMPEG` | No | auto-detected `ffmpeg` | Path to ffmpeg executable |

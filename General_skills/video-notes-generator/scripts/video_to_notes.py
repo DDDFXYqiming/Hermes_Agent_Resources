@@ -88,7 +88,11 @@ class TranscribeOutput:
 # 工具函数
 # ============================================================
 
-RUNTIME_DIR = os.getenv("VIDEO_NOTES_RUNTIME_DIR", r"E:\AI_Projects\video-notes-generator-runtime")
+RUNTIME_DIR = os.getenv("VIDEO_NOTES_RUNTIME_DIR") or os.path.join(
+    os.path.expanduser("~"),
+    ".cache",
+    "video-notes-generator",
+)
 
 
 def load_runtime_env():
