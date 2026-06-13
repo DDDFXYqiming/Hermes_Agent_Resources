@@ -1,8 +1,8 @@
 ---
 name: video-notes-generator
 description: "Use when user wants to summarize, analyze, or generate notes from a video URL. Converts video content into structured Markdown notes with timestamps, extracted visual frames, native multimodal image observations, and AI summaries. Supports Bilibili, YouTube, Douyin, Kuaishou, and local files."
-version: 1.0.0
-author: Diana (extracted from BiliNote v2.2.1 by JefferyHcool)
+version: 1.2.0
+author: Diana (extracted from BiliNote v2.4.0 by JefferyHcool)
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
@@ -13,12 +13,12 @@ metadata:
 
 # Video Notes Generator
 
-> Based on [BiliNote v2.2.1](https://github.com/JefferyHcool/BiliNote) by JefferyHcool.
+> Based on [BiliNote v2.4.0](https://github.com/JefferyHcool/BiliNote) by JefferyHcool.
 > No external LLM / API Key required. The Agent itself acts as the LLM for note generation.
 
 Converts video content from URLs or local files into structured, readable Markdown notes using AI. Supports multiple video platforms, transcription engines, note styles, and default visual frame extraction for native multimodal image understanding. Final Markdown must start with a horizontal Mermaid mind map and should use Mermaid diagrams wherever they clarify structure, process, timeline, or relationships.
 
-Extracted from **BiliNote v2.2.1** by JefferyHcool.
+Extracted from **BiliNote v2.4.0** by JefferyHcool. The local upstream checkout used for this sync is `E:/AI_Projects/MyProjects/Hermes_Agent_Resources/temp/upstream/BiliNote`.
 
 ## When to Use
 
@@ -61,7 +61,10 @@ python ~/.hermes/skills/media/video-notes-generator/scripts/video_to_notes.py \
 | `FFMPEG` | No | auto-detected `ffmpeg` | Path to ffmpeg executable |
 | `TRANSCRIBER_TYPE` | No | `faster-whisper` | Engine selection used by the script when subtitles are unavailable |
 | `WHISPER_CPP` | No | auto-detected | Optional whisper.cpp binary path |
-| `WHISPER_MODEL` | No | `base` | whisper.cpp model name when using `--transcribe` / whisper.cpp |
+| `WHISPER_MODEL` | No | `base` | whisper.cpp model name or faster-whisper alias when transcription is needed. Built-ins include `tiny`, `base`, `small`, `medium`, `large-v1`, `large-v2`, `large-v3`, `large-v3-turbo`. |
+| `VIDEO_NOTES_PROXY` | No | standard proxy env fallback | Explicit proxy URL for yt-dlp/subtitle/network calls. If unset, the script falls back to `<runtime>/config/proxy.json` when `enabled=true`, then `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`. Mirrors BiliNote v2.4.0 global proxy behavior. |
+| `VIDEO_NOTES_PROXY_CONFIG` | No | `<VIDEO_NOTES_RUNTIME_DIR>/config/proxy.json` | Optional proxy JSON path: `{ "enabled": true, "url": "http://127.0.0.1:7890" }`. |
+| `VIDEO_NOTES_WHISPER_MODEL_CONFIG` | No | `<VIDEO_NOTES_RUNTIME_DIR>/config/whisper_models.json` | Optional custom faster-whisper model mapping JSON: `{ "my-model": "Org/repo-or-local-path" }`, following BiliNote v2.4.0 configurable model registry. |
 | `VIDEO_NOTES_TRANSCRIPT_CHUNK_CHARS` | No | `3200` | Character budget per compact transcript chunk |
 | `VIDEO_NOTES_TRANSCRIPT_PREVIEW_CHARS` | No | `1200` | Transcript preview length in final notes |
 | `VIDEO_NOTES_MAX_AGENT_FRAMES` | No | `3` | Default maximum extracted frames for agent-safe multimodal analysis |
@@ -110,8 +113,8 @@ For Bilibili uploader-wide jobs ("summarize all videos from this UP"), see `refe
 
 | Platform | Subtitles | Download | Cookies | Notes |
 |---|---|---|---|---|
-| Bilibili | ✅ Priority | yt-dlp | Recommended | Subtitle-first; falls back to whisper |
-| YouTube | ✅ Priority | yt-dlp | Optional | Prefers existing subtitles |
+| Bilibili | ✅ Priority | yt-dlp + automatic public API fallback | Recommended for restricted videos | Subtitle-first; if yt-dlp hits HTTP 412, the script now fetches public metadata/playurl, downloads DASH audio/video with browser-like headers, muxes locally, then falls back to whisper |
+| YouTube | ✅ Priority | yt-dlp | Optional | Prefers existing subtitles; supports proxy via `VIDEO_NOTES_PROXY` / `config/proxy.json` / standard proxy env, aligned with BiliNote v2.4.0 |
 | Douyin | ❌ | yt-dlp + ABogus | Not needed | Anti-bot bypass built-in |
 | Kuaishou | ✅ | yt-dlp + helper | Not needed | Custom downloader |
 | Local | N/A | Direct file | N/A | Any format FFmpeg supports |
@@ -155,12 +158,13 @@ The CLI prints a short JSON summary by default. Do not use `--print-full-json` i
 
 1. **No ffmpeg**: Required system dependency. Install via `apt install ffmpeg` / `brew install ffmpeg` / `choco install ffmpeg`.
 2. **No yt-dlp**: Required for URL downloads. Install yt-dlp and optionally set `YTDLP` if it is not on PATH.
-3. **Bilibili download fails**: Set Bilibili cookies for restricted videos or videos that require login. Treat Windows SSL EOF/certificate failures as a fallback path, not the default workflow: retry with the native `yt-dlp.exe --no-check-certificate` in a small custom download/extraction script; avoid relying on a `.cmd` wrapper as `YTDLP` when Python subprocesses also pass Unicode output paths.
-4. **YouTube subtitle missing**: Falls back to audio transcription, which may be slow for long videos.
+3. **Bilibili download fails**: Set Bilibili cookies for restricted videos or videos that require login. For public videos where `yt-dlp` fails with `HTTP 412 Precondition Failed`, the script now automatically uses the Bilibili public API fallback documented in `references/bilibili-412-api-fallback.md`: fetch `x/web-interface/view`, fetch `x/player/playurl`, download DASH audio/video with browser-like headers, mux to a local MP4, then continue transcription and frame extraction. Treat Windows SSL EOF/certificate failures as a fallback path, not the default workflow: retry with native `curl -L -k` or `yt-dlp.exe --no-check-certificate`; avoid relying on a `.cmd` wrapper as `YTDLP` when Python subprocesses also pass Unicode output paths.
+4. **YouTube subtitle/download missing**: Falls back to audio transcription when subtitles are unavailable. For restricted networks, configure `VIDEO_NOTES_PROXY` or `<runtime>/config/proxy.json` before retrying; this mirrors BiliNote v2.4.0's global proxy behavior.
 5. **Frames missing**: Frames should be extracted by default. If `frame_count=0`, do not silently continue; retry video download/frame extraction, then use `--no-frames` only as a clearly reported fallback.
 6. **Long video (>2h)**: Automatically chunked and merged, but may take significant time.
 7. **Chinese output only**: The generated artifacts are Chinese-oriented; transform the final response manually if the user asks for another language/style.
 8. **Old parameters fail**: This script version does not support `--url`, `--file`, `--style`, `--format`, or `--quality`; pass the URL/local file as the positional `url` argument.
+9. **Custom faster-whisper models**: BiliNote v2.4.0 added a model registry. In this zero-pip skill script, add mappings to `<runtime>/config/whisper_models.json` or set `VIDEO_NOTES_WHISPER_MODEL_CONFIG`; built-in aliases include `large-v3` and `large-v3-turbo`.
 
 ## Verification Checklist
 

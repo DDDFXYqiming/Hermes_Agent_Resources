@@ -18,8 +18,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import ssl
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import timedelta
+from pathlib import Path
 from typing import List, Optional
 
 # ============================================================
@@ -119,10 +123,306 @@ TRANSCRIPT_CHUNK_CHARS = int(os.getenv("VIDEO_NOTES_TRANSCRIPT_CHUNK_CHARS", "32
 NOTES_TRANSCRIPT_PREVIEW_CHARS = int(os.getenv("VIDEO_NOTES_TRANSCRIPT_PREVIEW_CHARS", "1200"))
 MAX_AGENT_FRAMES = int(os.getenv("VIDEO_NOTES_MAX_AGENT_FRAMES", "3"))
 FRAME_MAX_WIDTH = int(os.getenv("VIDEO_NOTES_FRAME_MAX_WIDTH", "640"))
+VIDEO_NOTES_PROXY = os.getenv("VIDEO_NOTES_PROXY", "").strip()
+VIDEO_NOTES_PROXY_CONFIG = os.getenv("VIDEO_NOTES_PROXY_CONFIG", "")
+WHISPER_MODEL_CONFIG = os.getenv("VIDEO_NOTES_WHISPER_MODEL_CONFIG", "")
+
+# BiliNote v2.4.0 made proxy and Whisper model handling explicit.
+# Keep this script zero-pip, but mirror the same operator-facing behavior.
+BUILTIN_FASTER_WHISPER_MODELS = {
+    "tiny": "Systran/faster-whisper-tiny",
+    "base": "Systran/faster-whisper-base",
+    "small": "Systran/faster-whisper-small",
+    "medium": "Systran/faster-whisper-medium",
+    "large-v1": "Systran/faster-whisper-large-v1",
+    "large-v2": "Systran/faster-whisper-large-v2",
+    "large-v3": "Systran/faster-whisper-large-v3",
+    "large-v3-turbo": "Systran/faster-whisper-large-v3-turbo",
+}
 
 
 def runtime_path(*parts):
     return os.path.join(RUNTIME_DIR, *parts)
+
+
+def _read_json_file(path: str) -> dict:
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"[config] 读取 JSON 配置失败 {path}: {e}", file=sys.stderr)
+        return {}
+
+
+def get_effective_proxy() -> str:
+    """Return the proxy URL that should apply to yt-dlp and network helpers.
+
+    Mirrors BiliNote v2.4.0's precedence in a zero-pip CLI form:
+    explicit VIDEO_NOTES_PROXY > enabled runtime config/proxy.json > standard
+    HTTPS_PROXY/HTTP_PROXY/ALL_PROXY environment variables.
+    """
+    explicit_proxy = os.getenv("VIDEO_NOTES_PROXY", VIDEO_NOTES_PROXY).strip()
+    if explicit_proxy:
+        return explicit_proxy
+    proxy_config = os.getenv("VIDEO_NOTES_PROXY_CONFIG", VIDEO_NOTES_PROXY_CONFIG) or runtime_path("config", "proxy.json")
+    cfg = _read_json_file(proxy_config)
+    if cfg.get("enabled") and str(cfg.get("url") or "").strip():
+        return str(cfg.get("url")).strip()
+    for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        val = os.environ.get(key)
+        if val:
+            return val
+    return ""
+
+
+def yt_dlp_args() -> List[str]:
+    args = [YTDLP]
+    proxy = get_effective_proxy()
+    if proxy:
+        args.extend(["--proxy", proxy])
+    return args
+
+
+def bilibili_headers(referer: str = "https://www.bilibili.com/") -> dict:
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Referer": referer,
+        "Accept": "*/*",
+    }
+
+
+def extract_bilibili_bvid(url: str) -> str:
+    m = re.search(r"BV[0-9A-Za-z]+", url or "")
+    return m.group(0) if m else ""
+
+
+def fetch_json_url(url: str, headers: Optional[dict] = None, timeout: int = 30) -> Optional[dict]:
+    try:
+        req = urllib.request.Request(url, headers=headers or {})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+        data = json.loads(text)
+        return data if isinstance(data, dict) else None
+    except Exception as e:
+        print(f"[network] JSON 获取失败: {url.split('?')[0]}: {e}", file=sys.stderr)
+        return None
+
+
+def get_bilibili_api_metadata(url: str) -> Optional[dict]:
+    bvid = extract_bilibili_bvid(url)
+    if not bvid:
+        return None
+    referer = f"https://www.bilibili.com/video/{bvid}/"
+    data = fetch_json_url(
+        f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}",
+        headers=bilibili_headers(referer),
+    )
+    if not data or data.get("code") != 0 or not isinstance(data.get("data"), dict):
+        return None
+    return data["data"]
+
+
+def bilibili_metadata_to_video_info(url: str, data: dict) -> VideoInfo:
+    owner = data.get("owner") or {}
+    stat = data.get("stat") or {}
+    return VideoInfo(
+        video_url=url,
+        video_id=data.get("bvid", extract_bilibili_bvid(url)),
+        title=data.get("title", ""),
+        platform="bilibili",
+        uploader=owner.get("name", ""),
+        duration=parse_duration(data.get("duration", 0)),
+        view_count=int(stat.get("view", 0) or 0),
+        like_count=int(stat.get("like", 0) or 0),
+        tags=[],
+        description=(data.get("desc", "") or "")[:500],
+        chapters=[],
+    )
+
+
+def get_bilibili_api_playurl(url: str, cid: int) -> Optional[dict]:
+    bvid = extract_bilibili_bvid(url)
+    if not bvid or not cid:
+        return None
+    referer = f"https://www.bilibili.com/video/{bvid}/"
+    api = f"https://api.bilibili.com/x/player/playurl?bvid={bvid}&cid={cid}&qn=32&fnval=16&fourk=0"
+    data = fetch_json_url(api, headers=bilibili_headers(referer))
+    if not data or data.get("code") != 0:
+        return None
+    return data.get("data") or {}
+
+
+def bilibili_dash_url_candidates(items: list, prefer_audio: bool = False) -> List[str]:
+    if not items:
+        return []
+    # Some Bilibili CDN hosts occasionally return short/partial audio objects.
+    # Try normal bilivideo hosts before mcdn, and verify duration after download.
+    def score(item):
+        bw = int(item.get("bandwidth", 0) or 0)
+        url = item.get("baseUrl") or item.get("base_url") or ""
+        mcdn_penalty = 1 if "mcdn.bilivideo" in url else 0
+        return (mcdn_penalty, -bw if prefer_audio else bw)
+    urls = []
+    for item in sorted(items, key=score):
+        for key in ("baseUrl", "base_url"):
+            if item.get(key):
+                urls.append(item[key])
+        for key in ("backupUrl", "backup_url"):
+            for url in item.get(key) or []:
+                urls.append(url)
+    seen = set()
+    unique = []
+    for url in urls:
+        if url and url not in seen:
+            seen.add(url)
+            unique.append(url)
+    return unique
+
+
+def download_url_to_file(url: str, dest: str, referer: str) -> bool:
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    headers = bilibili_headers(referer)
+    curl = shutil.which("curl")
+    if curl:
+        cmd = [
+            curl, "-L", "-k", "--fail", "--retry", "3", "--retry-delay", "2",
+            "-A", headers["User-Agent"], "-e", headers["Referer"], url, "-o", dest,
+        ]
+        result = run_command(cmd, timeout=600, env=command_env())
+        if result.returncode == 0 and os.path.getsize(dest) > 0:
+            return True
+        print(f"[bilibili-api] curl 下载失败: {result.stderr[:200]}", file=sys.stderr)
+    try:
+        context = ssl._create_unverified_context()
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=600, context=context) as resp, open(dest, "wb") as f:
+            shutil.copyfileobj(resp, f)
+        return os.path.getsize(dest) > 0
+    except Exception as e:
+        print(f"[bilibili-api] urllib 下载失败: {e}", file=sys.stderr)
+        return False
+
+
+
+def download_bilibili_stream_candidates(urls: List[str], dest: str, referer: str, expected_duration: float, selector: str) -> bool:
+    min_duration = max(30.0, float(expected_duration or 0) * 0.80) if expected_duration else 0.0
+    for idx, stream_url in enumerate(urls, start=1):
+        # curl -o / Python open(..., 'wb') overwrites the candidate file in place;
+        # avoid explicit deletion so partial retry remains harmless and auditable.
+        print(f"[bilibili-api] 下载候选流 {idx}/{len(urls)} -> {os.path.basename(dest)}", file=sys.stderr)
+        if not download_url_to_file(stream_url, dest, referer):
+            continue
+        duration = probe_stream_duration(dest, selector) or probe_media_duration(dest)
+        if not min_duration or duration >= min_duration:
+            return True
+        print(
+            f"[bilibili-api] 候选流时长异常: {duration:.1f}s，期望约 {expected_duration:.1f}s，尝试下一个 CDN",
+            file=sys.stderr,
+        )
+    return False
+
+
+
+def merged_file_has_valid_streams(path: str, expected_duration: float) -> bool:
+    if not os.path.exists(path):
+        return False
+    min_duration = max(30.0, float(expected_duration or 0) * 0.80) if expected_duration else 0.0
+    video_duration = probe_stream_duration(path, "v:0")
+    audio_duration = probe_stream_duration(path, "a:0")
+    if not min_duration:
+        return video_duration > 0 and audio_duration > 0
+    return video_duration >= min_duration and audio_duration >= min_duration
+
+
+def download_bilibili_via_api(url: str, output_dir: str) -> Optional[AudioMeta]:
+    """Fallback for public Bilibili videos when yt-dlp hits HTTP 412.
+
+    Uses public metadata/playurl APIs, downloads DASH video/audio with browser-like
+    headers, muxes them to a local mp4, and returns that mp4 for transcription and
+    frame extraction. No cookies or API keys are written.
+    """
+    metadata = get_bilibili_api_metadata(url)
+    if not metadata:
+        return None
+    bvid = metadata.get("bvid") or extract_bilibili_bvid(url) or "bilibili"
+    safe_bvid = re.sub(r"[^\w-]", "", bvid)[:50]
+    fallback_dir = os.path.join(output_dir, f"{safe_bvid}_bilibili_api")
+    os.makedirs(fallback_dir, exist_ok=True)
+    merged = os.path.join(fallback_dir, f"{safe_bvid}_merged.mp4")
+    expected_duration = parse_duration(metadata.get("duration", 0))
+    if merged_file_has_valid_streams(merged, expected_duration):
+        return AudioMeta(
+            video_id=bvid,
+            title=metadata.get("title", bvid),
+            duration=probe_media_duration(merged),
+            platform="bilibili",
+            file_path=merged,
+            raw_info={"fallback": "bilibili_api", "metadata": metadata},
+        )
+    play = get_bilibili_api_playurl(url, metadata.get("cid"))
+    dash = (play or {}).get("dash") or {}
+    video_urls = bilibili_dash_url_candidates(dash.get("video") or [], prefer_audio=False)
+    audio_urls = bilibili_dash_url_candidates(dash.get("audio") or [], prefer_audio=True)
+    if not video_urls or not audio_urls:
+        print("[bilibili-api] playurl 未返回可用 DASH 音视频流", file=sys.stderr)
+        return None
+    referer = f"https://www.bilibili.com/video/{bvid}/"
+    video_file = os.path.join(fallback_dir, f"{safe_bvid}_video.m4s")
+    audio_file = os.path.join(fallback_dir, f"{safe_bvid}_audio.m4s")
+    metadata_file = os.path.join(fallback_dir, f"{safe_bvid}_metadata.json")
+    with open(metadata_file, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+    print("[bilibili-api] yt-dlp 不可用，使用 Bilibili API fallback 下载 DASH 音视频...", file=sys.stderr)
+    if not download_bilibili_stream_candidates(video_urls, video_file, referer, expected_duration, "v:0"):
+        return None
+    if not download_bilibili_stream_candidates(audio_urls, audio_file, referer, expected_duration, "a:0"):
+        return None
+    result = run_command([FFMPEG, "-y", "-i", video_file, "-i", audio_file, "-c", "copy", merged], timeout=300, env=command_env())
+    if result.returncode != 0 or not os.path.exists(merged):
+        print(f"[bilibili-api] ffmpeg 合并失败: {result.stderr[:300]}", file=sys.stderr)
+        return None
+    return AudioMeta(
+        video_id=bvid,
+        title=metadata.get("title", bvid),
+        duration=probe_media_duration(merged) or expected_duration,
+        platform="bilibili",
+        file_path=merged,
+        raw_info={"fallback": "bilibili_api", "metadata": metadata, "metadata_file": metadata_file},
+    )
+
+
+def resolve_faster_whisper_model(model: str) -> str:
+    """Resolve built-in/custom Faster Whisper model names.
+
+    Custom mappings live in VIDEO_NOTES_WHISPER_MODEL_CONFIG or
+    <runtime>/config/whisper_models.json as {"name": "HF/repo-or-local-path"}.
+    This mirrors BiliNote v2.4.0's configurable model registry without
+    introducing a server-side dependency tree.
+    """
+    name = (model or "base").strip()
+    custom_path = os.getenv("VIDEO_NOTES_WHISPER_MODEL_CONFIG", WHISPER_MODEL_CONFIG) or runtime_path("config", "whisper_models.json")
+    custom = _read_json_file(custom_path)
+    target = custom.get(name)
+    if isinstance(target, dict):
+        target = target.get("target")
+    if isinstance(target, str) and target.strip():
+        return target.strip()
+    if name in BUILTIN_FASTER_WHISPER_MODELS:
+        # Faster Whisper accepts size aliases directly and using aliases preserves
+        # offline cache compatibility; the explicit map documents valid options.
+        return name
+    if "/" in name or os.path.isdir(os.path.expanduser(name)):
+        return os.path.expanduser(name)
+    raise ValueError(
+        f"未知 faster-whisper 模型 '{name}'。内置可选: {', '.join(BUILTIN_FASTER_WHISPER_MODELS)}；"
+        "或在 VIDEO_NOTES_WHISPER_MODEL_CONFIG / config/whisper_models.json 中添加映射。"
+    )
 
 
 def run_command(cmd, timeout=60, env=None, cwd=None, check=False):
@@ -151,7 +451,12 @@ def command_env():
         os.path.dirname(FFMPEG) if os.path.isabs(FFMPEG) else "",
         os.environ.get("PATH", ""),
     ]
-    return {"PATH": os.pathsep.join(p for p in path_entries if p)}
+    env = {"PATH": os.pathsep.join(p for p in path_entries if p)}
+    proxy = get_effective_proxy()
+    if proxy:
+        env.setdefault("HTTP_PROXY", proxy)
+        env.setdefault("HTTPS_PROXY", proxy)
+    return env
 
 
 def get_ffprobe() -> str:
@@ -174,6 +479,24 @@ def probe_media_duration(path: str) -> float:
         ], timeout=30, env=command_env())
         if result.returncode == 0:
             return parse_duration((result.stdout or "").strip())
+    except Exception:
+        pass
+    return 0.0
+
+
+def probe_stream_duration(path: str, selector: str) -> float:
+    if not path or not os.path.exists(path):
+        return 0.0
+    try:
+        result = run_command([
+            get_ffprobe(), "-v", "error", "-select_streams", selector,
+            "-show_entries", "stream=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", path
+        ], timeout=30, env=command_env())
+        if result.returncode == 0:
+            durations = [parse_duration(line.strip()) for line in (result.stdout or "").splitlines() if line.strip()]
+            durations = [d for d in durations if d > 0]
+            return max(durations) if durations else 0.0
     except Exception:
         pass
     return 0.0
@@ -390,9 +713,10 @@ def transcribe_via_faster_whisper(audio_path: str, model: str = "base") -> Optio
 
     try:
         os.makedirs(runtime_path("models"), exist_ok=True)
-        print(f"[transcribe] faster-whisper 转写中 (model={model})...", file=sys.stderr)
+        resolved_model = resolve_faster_whisper_model(model)
+        print(f"[transcribe] faster-whisper 转写中 (model={model} -> {resolved_model})...", file=sys.stderr)
         whisper_model = WhisperModel(
-            model,
+            resolved_model,
             device=os.getenv("WHISPER_DEVICE", "cpu"),
             compute_type=os.getenv("WHISPER_COMPUTE_TYPE", "int8"),
             download_root=runtime_path("models"),
@@ -431,6 +755,43 @@ def parse_srt(srt_text: str) -> List[TranscriptSegment]:
         if text:
             segments.append(TranscriptSegment(start=start, end=end, text=text))
     return segments
+
+def parse_vtt(vtt_text: str) -> List[TranscriptSegment]:
+    """Parse WebVTT subtitles emitted by yt-dlp/YouTube fallback."""
+    text = vtt_text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"<[^>]+>", "", text)
+    segments = []
+    blocks = re.split(r"\n\n+", text.strip())
+    for block in blocks:
+        lines = [line.strip() for line in block.split("\n") if line.strip()]
+        if not lines or lines[0].upper().startswith("WEBVTT") or lines[0].startswith(("NOTE", "STYLE", "REGION")):
+            continue
+        time_line_index = next((i for i, line in enumerate(lines) if "-->" in line), -1)
+        if time_line_index < 0:
+            continue
+        time_line = lines[time_line_index]
+        time_match = re.match(r"([^\s]+)\s*-->\s*([^\s]+)", time_line)
+        if not time_match:
+            continue
+        def parse_vtt_time(ts: str) -> float:
+            ts = ts.replace(",", ".")
+            parts = ts.split(":")
+            parts = [float(p) for p in parts]
+            if len(parts) == 3:
+                return parts[0] * 3600 + parts[1] * 60 + parts[2]
+            if len(parts) == 2:
+                return parts[0] * 60 + parts[1]
+            return parts[0]
+        body = " ".join(lines[time_line_index + 1:]).strip()
+        body = re.sub(r"\s+", " ", body)
+        if body:
+            segments.append(TranscriptSegment(
+                start=parse_vtt_time(time_match.group(1)),
+                end=parse_vtt_time(time_match.group(2)),
+                text=body,
+            ))
+    return segments
+
 
 def parse_duration(seconds) -> float:
     try:
@@ -550,15 +911,24 @@ def get_video_info(url: str, platform: str) -> VideoInfo:
             platform=platform,
             duration=probe_media_duration(url),
         )
-    cmd = [YTDLP, "--dump-json", "--no-playlist", "--skip-download"]
-    env = {**os.environ, "PATH": f"{os.path.expanduser('~/.local/bin')}:{os.environ.get('PATH', '')}"}
-    result = subprocess.run(cmd + [url], capture_output=True, text=True, timeout=60, env=env)
+    cmd = yt_dlp_args() + ["--dump-json", "--no-playlist", "--skip-download"]
+    result = run_command(cmd + [url], timeout=60, env=command_env())
 
     if result.returncode != 0:
+        if platform == "bilibili":
+            metadata = get_bilibili_api_metadata(url)
+            if metadata:
+                print("[info] yt-dlp 元数据失败，已使用 Bilibili API 元数据 fallback", file=sys.stderr)
+                return bilibili_metadata_to_video_info(url, metadata)
         return VideoInfo(video_url=url, video_id=url.split("/")[-1][:50], platform=platform)
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError:
+        if platform == "bilibili":
+            metadata = get_bilibili_api_metadata(url)
+            if metadata:
+                print("[info] yt-dlp 元数据 JSON 解析失败，已使用 Bilibili API 元数据 fallback", file=sys.stderr)
+                return bilibili_metadata_to_video_info(url, metadata)
         return VideoInfo(video_url=url, platform=platform)
 
     return VideoInfo(
@@ -581,22 +951,25 @@ def get_video_subtitles(url: str, langs: List[str] = None) -> Optional[Transcrip
         langs = ["zh-Hans", "zh", "en"]
     print(f"[info] 尝试获取字幕 ({','.join(langs)})...", file=sys.stderr)
     tmpdir = tempfile.mkdtemp()
-    cmd = [YTDLP, "--write-subs", "--write-auto-sub", f"--sub-langs={','.join(langs)}",
-           "--sub-format=srt", f"--output={tmpdir}/%(id)s.%(ext)s", "--skip-download"]
-    env = {**os.environ, "PATH": f"{os.path.expanduser('~/.local/bin')}:{os.environ.get('PATH', '')}"}
-    result = subprocess.run(cmd + [url], capture_output=True, text=True, timeout=60, env=env)
+    cmd = yt_dlp_args() + ["--write-subs", "--write-auto-sub", f"--sub-langs={','.join(langs)}",
+           "--sub-format=srt/vtt/best", f"--output={tmpdir}/%(id)s.%(ext)s", "--skip-download"]
+    result = run_command(cmd + [url], timeout=90, env=command_env())
 
-    for f in os.listdir(tmpdir):
-        if f.endswith(".srt"):
-            srt_path = os.path.join(tmpdir, f)
-            with open(srt_path, "r", encoding="utf-8", errors="ignore") as sf:
-                segments = parse_srt(sf.read())
+    subtitle_files = sorted(os.listdir(tmpdir), key=lambda name: (not name.endswith(".srt"), name))
+    for f in subtitle_files:
+        if f.endswith((".srt", ".vtt")):
+            subtitle_path = os.path.join(tmpdir, f)
+            with open(subtitle_path, "r", encoding="utf-8", errors="ignore") as sf:
+                text = sf.read()
+            segments = parse_srt(text) if f.endswith(".srt") else parse_vtt(text)
             if segments:
                 return TranscriptResult(
                     language="zh",
                     full_text="\n".join(s.text for s in segments),
                     segments=segments
                 )
+    if result.returncode != 0:
+        print(f"[info] 字幕获取失败: {result.stderr[:200]}", file=sys.stderr)
     return None
 
 def download_audio(url: str, output_dir: str, platform: str) -> Optional[AudioMeta]:
@@ -611,13 +984,17 @@ def download_audio(url: str, output_dir: str, platform: str) -> Optional[AudioMe
             file_path=os.path.abspath(url),
         )
     output_template = os.path.join(output_dir, "%(id)s.%(ext)s")
-    cmd = [YTDLP, "-f", "bestaudio[ext=m4a]/bestaudio/best", "-o", output_template,
+    cmd = yt_dlp_args() + ["-f", "bestaudio[ext=m4a]/bestaudio/best", "-o", output_template,
            "--no-playlist", "--postprocessor-args", "ffmpeg:-b:a 64k"]
-    env = {**os.environ, "PATH": f"{os.path.expanduser('~/.local/bin')}:{os.environ.get('PATH', '')}"}
     print(f"[download] 正在下载音频...", file=sys.stderr)
-    result = subprocess.run(cmd + [url], capture_output=True, text=True, timeout=600, env=env)
+    result = run_command(cmd + [url], timeout=600, env=command_env())
     if result.returncode != 0:
         print(f"[error] 音频下载失败: {result.stderr[:200]}", file=sys.stderr)
+        if platform == "bilibili":
+            fallback = download_bilibili_via_api(url, output_dir)
+            if fallback:
+                print(f"[bilibili-api] fallback 成功: {fallback.file_path}", file=sys.stderr)
+                return fallback
         return None
 
     for f in os.listdir(output_dir):
@@ -643,8 +1020,7 @@ def download_video_for_frames(url: str, output_dir: str, platform: str) -> Optio
     frame_source_dir = os.path.join(output_dir, "visual_source_h264")
     os.makedirs(frame_source_dir, exist_ok=True)
     output_template = os.path.join(frame_source_dir, "%(id)s.%(ext)s")
-    cmd = [
-        YTDLP,
+    cmd = yt_dlp_args() + [
         "-f", "bestvideo[vcodec^=avc1][height<=720]+bestaudio/bestvideo[vcodec!=av01][height<=720]+bestaudio/best[height<=720]/best",
         "-o", output_template,
         "--no-playlist",
@@ -653,7 +1029,13 @@ def download_video_for_frames(url: str, output_dir: str, platform: str) -> Optio
     print("[vision] 正在下载视频用于抽帧...", file=sys.stderr)
     result = run_command(cmd + [url], timeout=900, env=command_env())
     if result.returncode != 0:
-        print(f"[vision] 视频下载失败，无法抽帧: {result.stderr[:200]}", file=sys.stderr)
+        print(f"[vision] 视频下载失败: {result.stderr[:200]}", file=sys.stderr)
+        if platform == "bilibili":
+            fallback = download_bilibili_via_api(url, output_dir)
+            if fallback:
+                print(f"[vision] 使用 Bilibili API fallback 视频抽帧: {fallback.file_path}", file=sys.stderr)
+                return fallback.file_path
+        print("[vision] 无法抽帧", file=sys.stderr)
         return None
 
     video_exts = (".mp4", ".mkv", ".webm", ".mov", ".flv", ".avi", ".m4v")
@@ -736,8 +1118,6 @@ def build_notes_markdown(output: TranscribeOutput, safe_id: str) -> str:
 
     safe_title = str(title).replace('"', "'")
     lines = [
-        f"# {title}",
-        "",
         "```mermaid",
         "flowchart LR",
         f"  V[\"{safe_title}\"] --> A[\"核心观点\"]",
@@ -746,6 +1126,8 @@ def build_notes_markdown(output: TranscribeOutput, safe_id: str) -> str:
         "  V --> D[\"风险与限制\"]",
         "  V --> E[\"视觉证据/关键帧\"]",
         "```",
+        "",
+        f"# {title}",
         "",
         "## 基本信息",
         "",
@@ -1025,7 +1407,9 @@ def main():
 
 环境变量:
   WHISPER_CPP    whisper.cpp 二进制路径 (默认自动查找)
-  WHISPER_MODEL  转写模型 (默认: base, 可选: tiny, small, medium)
+  WHISPER_MODEL  转写模型 (默认: base, 可选: tiny/base/small/medium/large-v3/large-v3-turbo 或自定义映射)
+  VIDEO_NOTES_PROXY  显式代理 URL；未设置时回退 config/proxy.json 与 HTTP_PROXY/HTTPS_PROXY
+  VIDEO_NOTES_WHISPER_MODEL_CONFIG  自定义 faster-whisper 模型映射 JSON
         """
     )
     parser.add_argument("url", help="视频 URL (Bilibili/YouTube/抖音) 或本地文件路径")
