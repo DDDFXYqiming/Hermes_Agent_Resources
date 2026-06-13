@@ -13,6 +13,7 @@ Video Notes Generator — 核心脚本 (零pip依赖版本)
 import argparse
 import json
 import os
+import platform as _platform_module
 import re
 import shutil
 import subprocess
@@ -25,6 +26,61 @@ from dataclasses import asdict, dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import List, Optional
+
+
+def _cleanup_agent_browser_chrome():
+    """Kill leftover agent-browser-chrome temporary profile processes.
+
+    These are NOT created by this script; they come from the Agent's browser_*
+    tools (e.g. browser_navigate / browser_snapshot) when the underlying Chrome
+    automation crashes or exits uncleanly. On Windows they accumulate under
+    --user-data-dir=...\agent-browser-chrome-<uuid> and can consume several GB
+    of RAM over time. We clean them at script startup to avoid resource leaks.
+    """
+    if _platform_module.system() != "Windows":
+        try:
+            subprocess.run(
+                ["pkill", "-f", "agent-browser-chrome"],
+                capture_output=True, timeout=15
+            )
+        except Exception:
+            pass
+        return
+    # Windows: find chrome.exe roots with agent-browser-chrome in cmdline but no --type=
+    try:
+        result = subprocess.run(
+            ["wmic", "process", "where", "name='chrome.exe'", "get", "ProcessId,CommandLine", "/format:csv"],
+            capture_output=True, text=True, timeout=30, encoding="utf-8", errors="replace"
+        )
+        if result.returncode != 0:
+            return
+        roots = []
+        for line in result.stdout.splitlines():
+            if "agent-browser-chrome" not in line:
+                continue
+            if "--type=" in line:
+                continue
+            # CSV format: Node,ProcessId,CommandLine
+            parts = line.split(",")
+            if len(parts) >= 2:
+                try:
+                    pid = int(parts[1].strip().strip('"'))
+                    roots.append(pid)
+                except ValueError:
+                    continue
+        for pid in roots:
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True, timeout=15
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+_cleanup_agent_browser_chrome()
 
 # ============================================================
 # 数据模型
