@@ -2030,3 +2030,8 @@ Next step:
 - Images include AI generation → Invoke Image_Generator
 - Otherwise → Invoke Executor (free design for every page)
 ```
+
+
+### 中文补注
+
+本节进一步强调：本文件作为公开技能资料，仅承载方法论、阅读路径、验收要点、公开共享要求；不包含本机绝对路径、个人目录、真实账号、真实密钥、临时下载目录或过细来源索引；任何 token、连接串、API 密钥在公开版中必须替换为 [REDACTED]。若与本技能 SKILL.md 冲突，以 SKILL.md 的目标、约束和验收标准为准；本节不替代英文细则，仅做中文导读与排错。
