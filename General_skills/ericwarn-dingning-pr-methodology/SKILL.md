@@ -18,7 +18,7 @@ metadata:
 
 ## Overview
 
-This skill packages the investment rules distilled from 雪球用户 `ericwarn丁宁` 的市赚率(PR)体系与用户整理文档 `C:\Users\39795\Desktop\books\雪球\PR.md`。它用于**估值优先**的价值投资判断：先看企业/指数是否便宜，再决定是否需要用技术分析寻找执行节奏。
+This skill packages a valuation-first 市赚率(PR) methodology distilled from user-provided notes and public investment writings. It is used for **估值优先**的价值投资判断：先看企业/指数是否便宜，再决定是否需要用技术分析寻找执行节奏。
 
 This is **not investment advice**. Use it to reproduce, audit, or explain 丁宁's methodology; always mark data freshness and source quality.
 
@@ -57,7 +57,7 @@ Do **not** use it as a short-term chart-trading system. For K线、EMA、KDJ、M
 ## Rule References
 
 - Core rulebook: `references/rulebook.md`
-- Evidence map and source notes: `references/evidence-map.md`
+- Evidence and verification notes: `references/evidence-map.md`
 - Data verification checklist: `references/data-verification.md`
 - Output template: `templates/pr-valuation-card.md`
 

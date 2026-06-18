@@ -16,7 +16,7 @@ If the automatic path breaks, repeat the same logic manually:
 
 ```bash
 OUT='temp/bilibili_manual_download'
-BVID='BV1gsE16bEi1'
+BVID='BV1xxxxx'
 UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36'
 REF="https://www.bilibili.com/video/$BVID/"
 # 1. fetch view metadata and cid with Python urllib

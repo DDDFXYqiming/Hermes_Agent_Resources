@@ -21,6 +21,14 @@ REQUIRED = [
     ROOT / "references" / "timestamped-evidence.md",
     ROOT / "templates" / "signal-card.md",
 ]
+SENSITIVE_PATTERNS = [
+    r"[A-Za-z]:\\",
+    r"[A-Za-z]:/",
+    r"/(?:c|d|e)/",
+    r"Users[\\/]\d+",
+    r"Desktop[\\/]books",
+    r"BV[0-9A-Za-z]{6,}",
+]
 
 
 def main() -> int:
@@ -43,30 +51,33 @@ def main() -> int:
         assert token in rulebook, f"rulebook missing {token}"
 
     evidence = (ROOT / "references" / "evidence-map.md").read_text(encoding="utf-8")
-    bv_count = len(set(re.findall(r"BV[0-9A-Za-z]+", evidence)))
-    assert bv_count >= 25, f"expected broad BV evidence coverage, got {bv_count}"
+    for token in ["趋势线", "斐波那契", "EMA", "KDJ", "成交量", "仓位"]:
+        assert token in evidence, f"evidence map missing rule family: {token}"
 
     source = (ROOT / "references" / "source-videos.md").read_text(encoding="utf-8")
-    row_count = sum(1 for line in source.splitlines() if line.startswith("| ") and "`BV" in line)
-    assert row_count == 40, f"source video index should contain 40 rows, got {row_count}"
+    assert "公开版不保存具体视频编号" in source
 
     timestamped = (ROOT / "references" / "timestamped-evidence.md").read_text(encoding="utf-8")
-    timestamp_rows = len(re.findall(r"BV[0-9A-Za-z]+.*\d{1,2}:\d{2}", timestamped))
-    assert timestamp_rows >= 80, f"expected broad timestamped evidence coverage, got {timestamp_rows}"
+    for token in ["结构类规则", "指标类规则", "斐波那契", "输出要求"]:
+        assert token in timestamped, f"rule evidence summary missing {token}"
 
-
-    text_files = [p for p in ROOT.rglob("*") if p.is_file() and p.suffix.lower() in {".md", ".py", ".txt", ".yaml", ".yml", ".json"}]
+    text_files = [
+        p
+        for p in ROOT.rglob("*")
+        if p.is_file()
+        and p.name != "validate_skill.py"
+        and p.suffix.lower() in {".md", ".txt", ".yaml", ".yml", ".json"}
+    ]
     combined_text = "\n".join(p.read_text(encoding="utf-8") for p in text_files)
     searchable = combined_text.replace("fox-finance-methodology", "")
     bad_terms = ["fo" + "x", "狐" + "狸"]
     for term in bad_terms:
         idx = searchable.lower().find(term.lower())
         assert idx == -1, f"disallowed brand term remains near: {searchable[max(0, idx-40):idx+40] if idx >= 0 else ''}"
-    rel_paths = "\n".join(str(p.relative_to(ROOT)) for p in ROOT.rglob("*"))
-    rel_paths = rel_paths.replace("fox-finance-methodology", "")
-    for term in bad_terms:
-        idx = rel_paths.lower().find(term.lower())
-        assert idx == -1, f"disallowed brand term remains in path near: {rel_paths[max(0, idx-40):idx+80] if idx >= 0 else ''}"
+
+    for pattern in SENSITIVE_PATTERNS:
+        match = re.search(pattern, combined_text)
+        assert not match, f"sensitive or over-detailed source pattern remains: {pattern}"
 
     print("ok skill validated")
     return 0

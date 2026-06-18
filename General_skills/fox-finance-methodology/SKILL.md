@@ -81,16 +81,16 @@ Then give one of these final labels only:
 
 Never output a vague conclusion like「看起来不错」without a rule row.
 
-## Evidence and Source Files
+## Evidence and Reference Files
 
 - Main rules: `references/rulebook.md`
 - Evidence map: `references/evidence-map.md`
-- Timestamped evidence: `references/timestamped-evidence.md`
-- Source video index: `references/source-videos.md`
+- Rule evidence summary: `references/timestamped-evidence.md`
+- Source corpus note: `references/source-videos.md`
 - Output template: `templates/signal-card.md`
 - Optional validator: `scripts/validate_skill.py`
 
-Source corpus default root: `<SOURCE_VIDEO_NOTES_ROOT>`. If moved, set `METHODOLOGY_VIDEO_NOTES_ROOT` to the new root.
+Public skill files intentionally omit local corpus paths, video IDs, and timestamp-level source indexes. If the user provides their own corpus, use it locally and keep paths out of reusable skill content.
 
 ## Common Pitfalls
 
@@ -105,6 +105,6 @@ Source corpus default root: `<SOURCE_VIDEO_NOTES_ROOT>`. If moved, set `METHODOL
 
 - [ ] Frontmatter is valid YAML and description is under 1024 characters.
 - [ ] Rulebook includes trigger, quant判定, action, invalidation, and evidence style.
-- [ ] Evidence map cites BV IDs/titles from the 40-video corpus.
+- [ ] Evidence map documents rule coverage without exposing local paths or over-detailed source indexes.
 - [ ] Template produces rule rows and a final label from the allowed set.
 - [ ] No rule is phrased as guaranteed investment advice.

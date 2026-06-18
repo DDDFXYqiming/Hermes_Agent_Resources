@@ -41,4 +41,25 @@ for term in ["PR-01", "PR-02", "PR-03", "PR-04", "fox-finance-methodology"]:
         print(f"rulebook missing term: {term}")
         sys.exit(1)
 
+combined = "\n".join(
+    p.read_text(encoding="utf-8")
+    for p in ROOT.rglob("*")
+    if p.is_file()
+    and p.name != "validate_skill.py"
+    and p.suffix.lower() in {".md", ".txt", ".yaml", ".yml", ".json"}
+)
+patterns = [
+    r"[A-Za-z]:\\",
+    r"[A-Za-z]:/",
+    r"/(?:c|d|e)/",
+    r"Users[\\/]\d+",
+    r"Desktop[\\/]books",
+    r"xueqiu\.com/\d+",
+    r"UID\s*`?\d+",
+]
+for pattern in patterns:
+    if re.search(pattern, combined):
+        print(f"Sensitive pattern remains: {pattern}")
+        sys.exit(1)
+
 print("OK: ericwarn-dingning-pr-methodology skill package validated")

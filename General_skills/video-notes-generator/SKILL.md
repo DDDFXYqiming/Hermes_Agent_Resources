@@ -18,7 +18,7 @@ metadata:
 
 Converts video content from URLs or local files into structured, readable Markdown notes using AI. Supports multiple video platforms, transcription engines, note styles, and default visual frame extraction for native multimodal image understanding. Final Markdown must start with a horizontal Mermaid mind map and should use Mermaid diagrams wherever they clarify structure, process, timeline, or relationships.
 
-Extracted from **BiliNote v2.4.0** by JefferyHcool. The local upstream checkout used for this sync is `E:/AI_Projects/MyProjects/Hermes_Agent_Resources/temp/upstream/BiliNote`.
+Extracted from **BiliNote v2.4.0** by JefferyHcool. Public skill files intentionally omit local checkout paths and temporary sync directories.
 
 ## When to Use
 

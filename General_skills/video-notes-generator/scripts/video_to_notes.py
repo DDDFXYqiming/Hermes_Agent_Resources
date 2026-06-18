@@ -1456,8 +1456,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  %(prog)s "https://www.bilibili.com/video/BV1TfRfBJEZw"
-  %(prog)s "https://www.bilibili.com/video/BV1TfRfBJEZw" -o ./my_notes/
+  %(prog)s "https://www.bilibili.com/video/BV1xxxxx"
+  %(prog)s "https://www.bilibili.com/video/BV1xxxxx" -o ./my_notes/
   %(prog)s "视频URL" --transcribe --model base
   %(prog)s "/path/to/local/video.mp4"
 
