@@ -257,6 +257,7 @@ font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Micr
 > 只有 `<g opacity="...">` 被禁止（见 SS2）。纯结构 `<g>` 是必需的。
 
 ### 5.2 viewBox
+### 中文：中文标题：5.2 viewBox
 
 固定为 `0 0 1280 720`（PPT 16:9），不可修改。
 
